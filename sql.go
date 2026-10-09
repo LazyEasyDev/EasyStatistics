@@ -9,6 +9,7 @@ import (
 	"fmt"
 	mathrand "math/rand"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -102,16 +103,28 @@ func (backend *sqlBackend) ensureExpiryIndex(ctx context.Context) error {
 		return nil
 	}
 	_, createError := backend.db.ExecContext(ctx, backend.dialect.createExpiryIndex())
-	if err := backend.db.QueryRowContext(ctx, query).Scan(&count); err != nil {
-		return fmt.Errorf("validate statistics expiry index: %w", errors.Join(createError, err))
+	for {
+		if err := backend.db.QueryRowContext(ctx, query).Scan(&count); err != nil {
+			return fmt.Errorf("validate statistics expiry index: %w", errors.Join(createError, err))
+		}
+		if count > 0 {
+			return nil
+		}
+		if createError == nil {
+			return errors.New("statistics expiry index was not created")
+		}
+		// TiDB can reject a competing CREATE INDEX before the first process's
+		// asynchronous DDL job publishes its index in the catalog. A single
+		// immediate recheck is not sufficient, even on an empty counter table.
+		// Only this explicitly pending-job error is waited on; a conflicting,
+		// unsuitable existing index or a permissions error must still fail.
+		if backend.dialect != SQLTiDB || !strings.Contains(createError.Error(), "a background job is trying to add the same index") {
+			return fmt.Errorf("create statistics expiry index: %w", createError)
+		}
+		if err := waitDelay(ctx, 200*time.Millisecond); err != nil {
+			return fmt.Errorf("wait for concurrent statistics expiry index: %w", errors.Join(createError, err))
+		}
 	}
-	if count > 0 {
-		return nil
-	}
-	if createError != nil {
-		return fmt.Errorf("create statistics expiry index: %w", createError)
-	}
-	return errors.New("statistics expiry index was not created")
 }
 
 func (backend *sqlBackend) schemaReady(ctx context.Context, index int) error {
