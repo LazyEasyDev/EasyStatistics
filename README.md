@@ -22,7 +22,6 @@ go get modernc.org/sqlite
 package main
 
 import (
-	"context"
 	"database/sql"
 	"fmt"
 	"log"
@@ -45,7 +44,7 @@ func run() error {
 	}
 	defer database.Close()
 
-	if err := EasyStatistics.Init(context.Background(), database, EasyStatistics.SQLSQLite, func(err error) {
+	if err := EasyStatistics.Init(database, EasyStatistics.SQLSQLite, func(err error) {
 		log.Printf("statistics: %v", err)
 	}); err != nil {
 		return err
@@ -107,6 +106,10 @@ In a server, initialize and register statistics **once during startup**, keep th
 
 A statistic declares all input field names. Each dimension selects an ordered subset of those fields and one or more time intervals.
 
+Each field name must be a case-sensitive, non-blank Go identifier (`go/token.IsIdentifier`), at most 255 UTF-8 bytes. Unicode letters are supported. Empty names, whitespace anywhere, punctuation, leading digits, Go keywords, and standalone `_` are rejected with an error. Names are never trimmed or normalized.
+
+Declared `fields` must not contain duplicates. Each `Dimension.OrderFields` must be a nonempty ordered subset of the declared fields, without duplicates. A field may be reused in different dimensions. Query headers (`OrderField.Name`) must match a configured dimension exactly, including case and order. These restrictions apply to field names, not their values; statistic-name rules are unchanged.
+
 The quick start updates three counters for each addition:
 
 | Dimension | Interval | Meaning |
@@ -127,7 +130,7 @@ if err := score.Add(map[string]any{"user": "alice", "activity": "mining"}, 10); 
 
 - Supply exactly the declared fields, even when querying a dimension that uses only some of them. Input map order does not matter.
 - Use strings, booleans, signed or unsigned integers, including `uintptr`, or named types with those underlying kinds. Floats, nil, pointers, slices, maps, structs, and complex values are rejected.
-- Values normalize to strings: `int(7)`, `uint64(7)`, and `"7"` identify the same value. Likewise, `true` and `"true"` match. Strings must be valid UTF-8; empty strings are allowed.
+- Values normalize to strings: `int(7)`, `uint64(7)`, and `"7"` identify the same value. Likewise, `true` and `"true"` match. Strings must be valid UTF-8. An empty value such as `map[string]any{"user": ""}` is valid; missing or nil values are not. Value strings are not trimmed, so `""` and `" "` identify different values.
 - Positive, negative, and zero deltas are accepted. Deltas and totals are `int64`; **keep accumulated totals within its range**. Arithmetic is not checked for overflow and can wrap.
 - `Add` performs no SQL work. It can be called concurrently, but callers must not modify an input map while it is being read.
 
@@ -140,7 +143,7 @@ if err != nil {
 }
 ```
 
-This returns the same instance created by `NewStatistics`. It does not create another worker or read SQL. An unknown name, an uninitialized library, or a canceled service returns an error.
+This returns the same instance created by `NewStatistics`. It does not create another worker or read SQL. An unknown name, an uninitialized library, or a closing or closed service returns an error.
 
 ### Query Counters
 
@@ -189,33 +192,45 @@ All buckets use UTC. Weeks start on Monday and follow ISO week years. `GroupFore
 
 ### Expire Inactive Records
 
-Set `Dimension.ClearAfter` to delete records that have not received a **persisted** addition within that duration. Zero disables expiry; negative durations are invalid. Positive durations round up to whole seconds.
+Set `Dimension.ClearAfter` to make persisted records eligible for deletion after that duration of inactivity. Zero disables expiry; negative durations are invalid. Positive durations round up to whole seconds.
 
-Retention applies to every value and interval in that dimension, including `GroupForever`. It is based on inactivity, not the age of the bucket. Cleanup runs before update attempts, including idle cycles and final uploads, using the database clock. Buffered data can later recreate an expired row. Keep application and database clocks synchronized, and use consistent policies across processes.
+Every insert or update stores `expire_time = last_update_time + ClearAfter` in SQL, using Unix seconds and the retained latest addition timestamp. With `ClearAfter == 0`, it stores `expire_time = 0`, which means never expire. Delayed uploads do not move `last_update_time` backwards or extend expiry merely because they were uploaded later.
+
+One service-wide cleanup worker runs at startup and every **minute**, even with no registered statistics. It uses the database clock to delete rows where `expire_time > 0` and `expire_time <= current time`, and also prunes old batch markers. Expiry survives process restarts and does not depend on re-registering the original dimension. No cleanup runs while all service processes are stopped; it resumes at startup.
+
+Expiry is **best-effort cleanup**, not a strict validity deadline. An expired row remains queryable until deleted. An update before deletion adds to the existing counter and refreshes expiry; an update after deletion creates a new counter. Both outcomes are intentional. Buffered rows can also recreate a deleted record.
+
+Retention applies to every value and interval in the dimension, including `GroupForever`, and is based on inactivity rather than bucket age. A changed `ClearAfter` policy applies when a row is written again; registration does not rewrite existing deadlines. Keep application and database clocks synchronized, and use consistent policies across processes.
+
+Each cleanup sweep has a **30-second SQL timeout**. Failures are reported through the error callback and tried again on the next scheduled sweep, without blocking uploads. `Close` stops scheduling sweeps and waits for any ongoing sweep to finish.
 
 ### Handle Errors
 
-`Init` accepts a `func(error)` for worker failures; pass `nil` to disable notifications. The callback receives batch-creation, retention-cleanup, upload, and batch-marker-deletion failures, wrapped with the statistic name.
+`Init` accepts a `func(error)` for worker failures; pass `nil` to disable notifications. The callback receives batch-creation, upload, and confirmed batch-marker-deletion failures wrapped with the statistic name. Service-wide cleanup failures are reported without a statistic name.
 
-The callback runs synchronously, outside the buffer and service locks. Different workers may call it concurrently. Keep it quick and protect shared application state. **Do not call `Close` or `Wait` synchronously from the callback**, because they wait for that worker to exit.
+The callback runs synchronously, outside the buffer and service locks. Different workers may call it concurrently. Keep it quick and protect shared application state. **Do not call `Close` synchronously from the callback**, because it waits for that worker to exit.
 
-Initialization, registration, lookup, `Add`, and query errors return directly to their callers. The library does not expose shared error sentinels or store a latest-error status.
+Initialization, registration, lookup, `Add`, and query errors return directly to their callers. Worker errors are reported only through `onError`; they are not stored or returned by `Close`. A nil callback discards these notifications. The library does not expose shared error sentinels or a latest-error status.
 
 ### Shut Down
 
-Call `EasyStatistics.Close()` to stop normal operation and wait for workers to attempt their remaining uploads. Alternatively, cancel the context passed to `Init`, then call `EasyStatistics.Wait()` to observe completion.
+Call `EasyStatistics.Close()` explicitly during application shutdown. It stops accepting new work, signals workers to drain, and waits for their remaining uploads. `Init` does not accept an application context, and application cancellation does not shut down the library.
 
 | Operation | Behavior |
 | --- | --- |
-| `Close` | Cancels the service and waits for its workers |
-| `Wait` | Waits for cancellation or `Close`, then waits for workers |
-| Repeated `Close` or `Wait` | Observes the completed shutdown; does not restart uploads |
+| `Close` | Stops admission and waits for workers to finish; returns nil after initialization |
+| Concurrent `Close` | All callers wait for the same workers to finish |
+| Repeated `Close` | Returns nil; does not restart uploads |
 
-Workers attempt pending and active batches in order, continuing only while successful. **A failed final attempt is reported once and that worker exits without retrying.** Remaining data stays in memory and is lost when the process exits.
+The service owns one internal context for schema setup, uploads, and cleanup. It remains alive throughout draining and is canceled only after workers finish. `Close` stops scheduling cleanup sweeps and waits for any ongoing sweep while statistics workers drain. Those workers finish pending and active snapshots in order through the same retrying submission logic used during normal operation. Failed mini-batch attempts are reported and retried after **10 seconds**, with a fresh timeout per attempt. Confirmed mini-batches are not replayed.
 
-`Close` and `Wait` return nil after initialized shutdown, even when an upload failed. Their return values are not delivery confirmation; use the callback for worker failures. Calls before initialization return an error. Registrations, lookups, additions, and queries reject a canceled service.
+There is **no overall shutdown deadline**. An unavailable server, invalid schema, or another persistent upload failure can make shutdown wait indefinitely. If a worker observes that the `*sql.DB` pool is permanently closed, it reports the failure through `onError`, stops new work, and exits. Unuploaded data stays in memory and is lost when the process exits.
 
-The library never closes or reconfigures your database pool. Close it after `Close` or `Wait` returns. Shutdown still waits for ongoing SQL attempts and callbacks to finish.
+After initialization, `Close` returns nil once all workers have exited. This does not guarantee that every buffered update was persisted; worker failures are available only through `onError`. Calling `Close` before initialization returns an error. Registrations, lookups, additions, and queries reject a closing or closed service.
+
+Each accepted query owns an independent **30-second SQL timeout context**. `Close` does not wait for caller queries or cancel them. Queries accepted before shutdown may finish after `Close` returns, subject to their own timeout; new queries are rejected once shutdown begins.
+
+The library never closes or reconfigures your database pool. Keep it open, and keep the process alive, until `Close` returns and all caller queries have finished. Shutdown waits for background uploads, cleanup sweeps, retry delays, and callbacks, not application query calls.
 
 ## Database Options
 
@@ -234,16 +249,19 @@ Pass the dialect matching your database to `Init` and import its driver in your 
 
 `Init` checks connectivity, creates missing tables, and checks that required columns are readable. It does not migrate existing tables or fully validate their types and constraints. The database account needs table-creation permission for initial setup and read/write/delete permissions during operation.
 
+The counter table requires the `expire_time` column. Existing tables created without it must be updated separately before initialization; there is no automatic schema migration.
+
+The Oracle insert explicitly stores an empty dimension value as a non-null empty CLOB rather than SQL NULL.
+
 SQL dialect support is implemented for the databases above; it is not a claim that every driver or server version has been live-tested. SQLite was exercised during development. Validate your chosen driver and deployment before production use.
 
 ## API Reference
 
 ```text
-Init(ctx context.Context, database *sql.DB, dialect SQLDialect, onError func(error)) error
+Init(database *sql.DB, dialect SQLDialect, onError func(error)) error
 NewStatistics(name string, updateInterval time.Duration, fields []string, dimensions []Dimension) (*Statistics, error)
 GetStatistics(name string) (*Statistics, error)
 Close() error
-Wait() error
 
 (*Statistics).Add(values map[string]any, delta int64) error
 (*Statistics).Get(orderFields []OrderField, interval GroupInterval, groupedTime string) (*Record, error)
@@ -255,28 +273,50 @@ There is one successful initialization per process, even after shutdown. A faile
 
 ## Design Notes
 
+Dialect helpers in [dialect.go](dialect.go) generate SQL using only `SQLDialect`; they do not depend on the database backend. [sql.go](sql.go) owns SQL execution, transactions, batch identity, timeouts, and upload retries. [statistics.go](statistics.go) owns buffering, the normal update interval, and final draining. [store.go](store.go) owns the service lifecycle and global cleanup worker.
+
 ### Buffering And Retries
 
-Each statistic has its own active buffer, pending batch, update interval, and worker. At an update, the worker detaches the active map and replaces it with an empty one; new additions continue while SQL work runs outside the buffer lock. Input normalization and bucket/key creation also happen before `Add` takes that lock.
+Each statistic has its own independently locked active buffer shards, pending batch, update interval, and worker. The `shardNum` constant in [statistics.go](statistics.go) defaults to **8** and applies to every statistic. It is a source-level setting, not a runtime option; use a positive value. Setting it to `1` uses one active buffer.
 
-A failed background attempt waits **10 seconds** before retrying, including when the database pool is closed. The same pending batch is retained; no newer batch is submitted first. Successful attempts restart the statistic's normal update interval. SQL queries and upload attempts use **30-second contexts**, which require driver cancellation support to be effective.
+Active maps use structured keys containing the encoded dimension fields, encoded values, interval, and bucket instead of generated record IDs. Each key is routed with `shardIndex = hash(dimension, value, interval, bucket) % shardNum`, using 64-bit FNV-1a. The same key always maps to the same shard within its statistic, so a record has at most one active entry. Hash collisions share a shard, not a map entry; the full structured key still identifies the record.
 
-Cleanup runs in the same worker before submission, not in a separate timer or worker. It also runs on idle update cycles. With no registered statistics, no periodic cleanup runs.
+Input normalization, value escaping, time-bucket calculation, and shard selection happen before locking. An `Add` can affect several shards. It acquires the affected locks in index order to avoid deadlocks, checks the closing signal before applying any changes, and releases the locks in reverse order.
+
+`Add` uses a local buffer for up to eight counter changes. Definitions producing more changes use a heap-allocated buffer; eight is not a limit on configured dimensions or intervals.
+
+At an update, the worker replaces each shard's active map with an empty one under that shard's lock. Outside those locks, it generates the existing record ID once per detached row when creating the pending batch. No cross-shard contribution merge is needed. SQL work also runs outside shard locks. Record IDs and counter identities remain unchanged; SQL rows additionally store their expiry deadline.
+
+Different keys can use different shard locks, but updates to one hot key always serialize on its owning shard. More shards can distribute different keys more widely; they do not spread one key across multiple locks. A pending batch can retain an earlier contribution while newer additions to that key accumulate in its active shard.
+
+The shard mutexes are spaced 128 bytes apart on 64-bit builds. This reduces false sharing on CPUs with common 64-byte or 128-byte cache lines without changing routing or locking behavior. With eight shards, the padding adds 896 bytes per statistic. Its performance benefit depends on the CPU and caller concurrency; it does not eliminate contention within a shard and is not a guaranteed speedup on every server.
+
+Deferring record IDs avoids repeated JSON encoding and hashing when many additions update the same records. With mostly unique records, that work moves to batch preparation rather than disappearing. Conversion to SQL rows also adds batch-preparation allocations, and structured active keys can use more memory.
+
+The SQL backend splits a pending snapshot into mini-batches of at most **500 rows**, controlled by the positive `miniBatchSize` constant in [sql.go](sql.go). Mini-batches are submitted sequentially, with one transaction per mini-batch. Confirmed rows are removed from the pending snapshot before proceeding; the current mini-batch is retained unchanged across failures. Newer snapshots do not overtake pending rows. Atomicity is per mini-batch, not per complete snapshot.
+
+Failed attempts retry inside the SQL backend after **10 seconds** until successful or a closed-pool error is detected. `Close` leaves in-flight submissions and retry waits running with the same internal context, then drains newer active rows. Successful snapshot submissions restart the statistic's normal update interval. An unreachable database server is not treated as a permanently closed pool.
+
+The SQL backend gives schema setup, reads, each cleanup sweep, and each mini-batch attempt a **30-second child context** of the internal service context. Cleanup is independent of uploads and cannot consume a mini-batch's write timeout. Each following mini-batch and every retry receives a fresh budget; there is no overall snapshot deadline. Timeouts require driver cancellation support to be effective. Writes remain sequential `SELECT` plus `INSERT` or `UPDATE` statements within each transaction, not bulk SQL.
+
+Uploads perform no retention cleanup. The single service-wide cleanup worker uses `cleanupInterval` in [store.go](store.go), which defaults to one minute. It deletes expired records directly with a SQL predicate instead of selecting IDs for later deletion. Multiple service processes may run sweeps against the same database; deletion always checks the currently stored deadline.
 
 ### Storage And Batch Identity
 
-`easy_statistics` stores counters and their identities. Ordered field names and normalized values occupy separate, URL-escaped text columns. SHA-256 keys identify dimensions and records without relying on database text collations. SQL timestamps use Unix seconds; delayed uploads never lower a record's last-update timestamp.
+`easy_statistics` stores counters, their identities, and `expire_time`. Ordered field names and normalized values occupy separate, URL-escaped text columns. SHA-256 keys identify dimensions and records without relying on database text collations. SQL timestamps use Unix seconds; delayed uploads never lower a record's last-update timestamp. Expiry is recalculated from that retained timestamp and the incoming row's `ClearAfter` policy, with zero reserved for non-expiring rows.
 
-`easy_statistics_batches` stores a random 256-bit batch ID and a database-generated creation timestamp. Counter changes and the marker commit in one transaction. Retrying an uncertain commit checks the same ID, so a retained marker prevents reapplying that batch. After confirmation, the marker is deleted; a failed deletion does not reapply confirmed counter changes.
+`easy_statistics_batches` stores a random 256-bit batch ID and a database-generated creation timestamp. The SQL backend creates a distinct ID for each mini-batch before its first database attempt and retains it across retries. That mini-batch's counter changes and marker commit in one transaction. Retrying an uncertain commit checks the same ID, so a retained marker prevents reapplying its counters. After confirmation, the marker is deleted; a failed deletion does not reapply confirmed changes or advance to the next mini-batch.
 
-Markers older than **30 days** are pruned during update attempts. This cleanup is independent of dimension retention. For large counter tables, an optional index on `(dimension_id, last_update_time)` can speed up expiry; the library does not add it automatically.
+Markers older than **30 days** are pruned by the global cleanup worker. Removing a confirmed mini-batch's marker remains part of its submission, so confirmation can advance to the next mini-batch. For large counter tables, an optional index on `expire_time` can speed up expiry; the library does not add it automatically.
 
 ### Reliability Limits
 
 This library is for **approximate statistics**, not a durable event ledger:
 
 - A crash loses buffered additions because buffers exist only in memory.
-- A failed final upload is not retried during shutdown.
+- Shutdown may wait indefinitely for a persistent database failure; a closed pool stops submission and reports its error through `onError`.
+- Expiry is opportunistic: expired rows remain visible and can be refreshed until a cleanup sweep deletes them.
+- Mini-batches commit independently, so queries can observe a partially uploaded snapshot.
 - An unavailable database can increase memory use as new values accumulate.
 - An uncertain batch resumed after its marker expires may be counted again.
 - Counter arithmetic can overflow if callers allow totals outside the `int64` range.

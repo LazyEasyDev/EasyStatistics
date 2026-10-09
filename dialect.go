@@ -36,6 +36,7 @@ func schemaFor(dialect SQLDialect) ([]string, error) {
 "group_interval" VARCHAR(8) NOT NULL,
 "grouped_time" BIGINT NOT NULL,
 "last_update_time" BIGINT NOT NULL,
+"expire_time" BIGINT NOT NULL,
 "counter" BIGINT NOT NULL
 )`,
 			`CREATE TABLE IF NOT EXISTS "easy_statistics_batches" ("batch_id" VARCHAR(96) PRIMARY KEY, "created_unix_time" BIGINT NOT NULL)`,
@@ -51,6 +52,7 @@ func schemaFor(dialect SQLDialect) ([]string, error) {
 				"`group_interval` VARCHAR(8) NOT NULL," +
 				"`grouped_time` BIGINT NOT NULL," +
 				"`last_update_time` BIGINT NOT NULL," +
+				"`expire_time` BIGINT NOT NULL," +
 				"`counter` BIGINT NOT NULL" +
 				") ENGINE=InnoDB DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_bin",
 			"CREATE TABLE IF NOT EXISTS `easy_statistics_batches` (`batch_id` VARCHAR(96) CHARACTER SET ascii COLLATE ascii_bin PRIMARY KEY, `created_unix_time` BIGINT NOT NULL) ENGINE=InnoDB",
@@ -66,6 +68,7 @@ func schemaFor(dialect SQLDialect) ([]string, error) {
 "group_interval" TEXT NOT NULL,
 "grouped_time" INTEGER NOT NULL,
 "last_update_time" INTEGER NOT NULL,
+"expire_time" INTEGER NOT NULL,
 "counter" INTEGER NOT NULL
 ) WITHOUT ROWID`,
 			`CREATE TABLE IF NOT EXISTS "easy_statistics_batches" ("batch_id" TEXT PRIMARY KEY, "created_unix_time" INTEGER NOT NULL) WITHOUT ROWID`,
@@ -80,6 +83,7 @@ func schemaFor(dialect SQLDialect) ([]string, error) {
 [group_interval] VARCHAR(8) NOT NULL,
 [grouped_time] BIGINT NOT NULL,
 [last_update_time] BIGINT NOT NULL,
+[expire_time] BIGINT NOT NULL,
 [counter] BIGINT NOT NULL`),
 			sqlServerCreate(batchTableName, `[batch_id] VARCHAR(96) NOT NULL PRIMARY KEY, [created_unix_time] BIGINT NOT NULL`),
 		}, nil
@@ -93,6 +97,7 @@ func schemaFor(dialect SQLDialect) ([]string, error) {
 "group_interval" VARCHAR2(8) NOT NULL,
 "grouped_time" NUMBER(19) NOT NULL,
 "last_update_time" NUMBER(19) NOT NULL,
+"expire_time" NUMBER(19) NOT NULL,
 "counter" NUMBER(19) NOT NULL`),
 			oracleCreate(batchTableName, `"batch_id" VARCHAR2(96) PRIMARY KEY, "created_unix_time" NUMBER(19) NOT NULL`),
 		}, nil
@@ -123,8 +128,8 @@ EXCEPTION WHEN OTHERS THEN
 END;`, table, columns, table)
 }
 
-func (backend *sqlBackend) quote(identifier string) string {
-	switch backend.dialect {
+func (dialect SQLDialect) quote(identifier string) string {
+	switch dialect {
 	case SQLMySQL, SQLMariaDB, SQLTiDB:
 		return "`" + identifier + "`"
 	case SQLServer:
@@ -134,8 +139,8 @@ func (backend *sqlBackend) quote(identifier string) string {
 	}
 }
 
-func (backend *sqlBackend) bind(index int) string {
-	switch backend.dialect {
+func (dialect SQLDialect) bind(index int) string {
+	switch dialect {
 	case SQLPostgreSQL, SQLGaussDB:
 		return fmt.Sprintf("$%d", index)
 	case SQLServer:
@@ -147,40 +152,40 @@ func (backend *sqlBackend) bind(index int) string {
 	}
 }
 
-func (backend *sqlBackend) columns(names ...string) string {
+func (dialect SQLDialect) columns(names ...string) string {
 	quoted := make([]string, len(names))
 	for index, name := range names {
-		quoted[index] = backend.quote(name)
+		quoted[index] = dialect.quote(name)
 	}
 	return strings.Join(quoted, ", ")
 }
 
-func (backend *sqlBackend) insert(table string, names ...string) string {
+func (dialect SQLDialect) insert(table string, names ...string) string {
 	parameters := make([]string, len(names))
 	for index := range names {
-		parameters[index] = backend.bind(index + 1)
+		parameters[index] = dialect.bind(index + 1)
 	}
-	return "INSERT INTO " + backend.quote(table) + " (" + backend.columns(names...) + ") VALUES (" + strings.Join(parameters, ", ") + ")"
+	return "INSERT INTO " + dialect.quote(table) + " (" + dialect.columns(names...) + ") VALUES (" + strings.Join(parameters, ", ") + ")"
 }
 
-func (backend *sqlBackend) selectRecord(locked bool) string {
-	query := "SELECT " + backend.columns("name", "dimension_id", "dimension_fields", "dimension_value", "group_interval", "grouped_time", "last_update_time", "counter") + " FROM " + backend.quote(tableName)
-	if locked && backend.dialect == SQLServer {
+func (dialect SQLDialect) selectRecord(locked bool) string {
+	query := "SELECT " + dialect.columns("name", "dimension_id", "dimension_fields", "dimension_value", "group_interval", "grouped_time", "last_update_time", "counter") + " FROM " + dialect.quote(tableName)
+	if locked && dialect == SQLServer {
 		query += " WITH (UPDLOCK, HOLDLOCK)"
 	}
-	query += " WHERE " + backend.quote("record_id") + " = " + backend.bind(1)
-	if locked && backend.dialect != SQLSQLite && backend.dialect != SQLServer {
+	query += " WHERE " + dialect.quote("record_id") + " = " + dialect.bind(1)
+	if locked && dialect != SQLSQLite && dialect != SQLServer {
 		query += " FOR UPDATE"
 	}
 	return query
 }
 
-func (backend *sqlBackend) selectBatch() string {
-	return "SELECT " + backend.quote("batch_id") + " FROM " + backend.quote(batchTableName) + " WHERE " + backend.quote("batch_id") + " = " + backend.bind(1)
+func (dialect SQLDialect) selectBatch() string {
+	return "SELECT " + dialect.quote("batch_id") + " FROM " + dialect.quote(batchTableName) + " WHERE " + dialect.quote("batch_id") + " = " + dialect.bind(1)
 }
 
-func (backend *sqlBackend) currentUnixTime() string {
-	switch backend.dialect {
+func (dialect SQLDialect) currentUnixTime() string {
+	switch dialect {
 	case SQLPostgreSQL, SQLGaussDB:
 		return "CAST(FLOOR(EXTRACT(EPOCH FROM CURRENT_TIMESTAMP)) AS BIGINT)"
 	case SQLMySQL, SQLMariaDB, SQLTiDB:
@@ -194,40 +199,44 @@ func (backend *sqlBackend) currentUnixTime() string {
 	}
 }
 
-func (backend *sqlBackend) insertBatch() string {
-	return "INSERT INTO " + backend.quote(batchTableName) + " (" + backend.columns("batch_id", "created_unix_time") + ") VALUES (" + backend.bind(1) + ", " + backend.currentUnixTime() + ")"
+func (dialect SQLDialect) insertBatch() string {
+	return "INSERT INTO " + dialect.quote(batchTableName) + " (" + dialect.columns("batch_id", "created_unix_time") + ") VALUES (" + dialect.bind(1) + ", " + dialect.currentUnixTime() + ")"
 }
 
-func (backend *sqlBackend) deleteBatch() string {
-	return "DELETE FROM " + backend.quote(batchTableName) + " WHERE " + backend.quote("batch_id") + " = " + backend.bind(1)
+func (dialect SQLDialect) deleteBatch() string {
+	return "DELETE FROM " + dialect.quote(batchTableName) + " WHERE " + dialect.quote("batch_id") + " = " + dialect.bind(1)
 }
 
-func (backend *sqlBackend) pruneBatches() string {
-	return "DELETE FROM " + backend.quote(batchTableName) + " WHERE " + backend.quote("created_unix_time") + " < " + backend.currentUnixTime() + " - " + backend.bind(1)
+func (dialect SQLDialect) pruneBatches() string {
+	return "DELETE FROM " + dialect.quote(batchTableName) + " WHERE " + dialect.quote("created_unix_time") + " < " + dialect.currentUnixTime() + " - " + dialect.bind(1)
 }
 
-func (backend *sqlBackend) pruneRecords() string {
-	return "DELETE FROM " + backend.quote(tableName) + " WHERE " + backend.quote("dimension_id") + " = " + backend.bind(1) + " AND " + backend.quote("last_update_time") + " < " + backend.currentUnixTime() + " - " + backend.bind(2)
+func (dialect SQLDialect) pruneRecords() string {
+	return "DELETE FROM " + dialect.quote(tableName) + " WHERE " + dialect.quote("expire_time") + " > 0 AND " + dialect.quote("expire_time") + " <= " + dialect.currentUnixTime()
 }
 
-func (backend *sqlBackend) insertRecord() string {
-	return backend.insert(tableName, "record_id", "name", "dimension_id", "dimension_fields", "dimension_value", "group_interval", "grouped_time", "last_update_time", "counter")
+func (dialect SQLDialect) insertRecord() string {
+	names := []string{"record_id", "name", "dimension_id", "dimension_fields", "dimension_value", "group_interval", "grouped_time", "last_update_time", "expire_time", "counter"}
+	if dialect == SQLOracle {
+		return "INSERT INTO " + dialect.quote(tableName) + " (" + dialect.columns(names...) + ") VALUES (:1, :2, :3, :4, NVL(TO_CLOB(:5), EMPTY_CLOB()), :6, :7, :8, :9, :10)"
+	}
+	return dialect.insert(tableName, names...)
 }
 
-func (backend *sqlBackend) updateRecord() string {
-	return "UPDATE " + backend.quote(tableName) + " SET " + backend.quote("counter") + " = " + backend.bind(1) + ", " + backend.quote("last_update_time") + " = " + backend.bind(2) + " WHERE " + backend.quote("record_id") + " = " + backend.bind(3)
+func (dialect SQLDialect) updateRecord() string {
+	return "UPDATE " + dialect.quote(tableName) + " SET " + dialect.quote("counter") + " = " + dialect.bind(1) + ", " + dialect.quote("last_update_time") + " = " + dialect.bind(2) + ", " + dialect.quote("expire_time") + " = " + dialect.bind(3) + " WHERE " + dialect.quote("record_id") + " = " + dialect.bind(4)
 }
 
-func (backend *sqlBackend) schemaQuery(index int) string {
+func (dialect SQLDialect) schemaQuery(index int) string {
 	table := tableName
-	names := []string{"record_id", "name", "dimension_id", "dimension_fields", "dimension_value", "group_interval", "grouped_time", "last_update_time", "counter"}
+	names := []string{"record_id", "name", "dimension_id", "dimension_fields", "dimension_value", "group_interval", "grouped_time", "last_update_time", "expire_time", "counter"}
 	if index == 1 {
 		table = batchTableName
 		names = []string{"batch_id", "created_unix_time"}
 	}
 	columns := make([]string, len(names))
 	for position, name := range names {
-		columns[position] = backend.quote(table) + "." + backend.quote(name)
+		columns[position] = dialect.quote(table) + "." + dialect.quote(name)
 	}
-	return "SELECT " + strings.Join(columns, ", ") + " FROM " + backend.quote(table) + " WHERE 1 = 0"
+	return "SELECT " + strings.Join(columns, ", ") + " FROM " + dialect.quote(table) + " WHERE 1 = 0"
 }

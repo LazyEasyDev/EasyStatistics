@@ -1,12 +1,12 @@
 package EasyStatistics
 
 import (
-	"context"
-	"crypto/rand"
 	"database/sql"
-	"encoding/hex"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"go/token"
+	"hash/fnv"
 	"net/url"
 	"strconv"
 	"strings"
@@ -16,10 +16,7 @@ import (
 	"unicode/utf8"
 )
 
-const (
-	retryDelay = 10 * time.Second
-	sqlTimeout = 30 * time.Second
-)
+const shardNum = 8
 
 type Statistics struct {
 	name           string
@@ -28,10 +25,39 @@ type Statistics struct {
 	rowsPerAdd     int
 	updateInterval time.Duration
 	service        *service
-	onError        func(error)
-	mu             sync.Mutex
-	active         map[string]counterRow
+	shards         [shardNum]counterShard
 	pending        *uploadBatch
+}
+
+type counterShard struct {
+	mu     sync.Mutex
+	active map[counterKey]counterRow
+	_      [112]byte
+}
+
+type counterKey struct {
+	dimension string
+	value     string
+	interval  GroupInterval
+	bucket    int64
+}
+
+type counterChange struct {
+	key        counterKey
+	row        counterRow
+	shardIndex int
+}
+
+func (key counterKey) shardIndex() int {
+	hasher := fnv.New64a()
+	for _, text := range [3]string{key.dimension, key.value, string(key.interval)} {
+		hasher.Write([]byte(text))
+		hasher.Write([]byte{0})
+	}
+	var bucket [8]byte
+	binary.LittleEndian.PutUint64(bucket[:], uint64(key.bucket))
+	hasher.Write(bucket[:])
+	return int(hasher.Sum64() % uint64(shardNum))
 }
 
 func validateIdentifier(name string) error {
@@ -55,8 +81,8 @@ func validateDefinition(name string, updateInterval time.Duration, fields []stri
 	}
 	known := make(map[string]bool, len(fields))
 	for _, field := range fields {
-		if err := validateIdentifier(field); err != nil {
-			return nil, nil, err
+		if len(field) > 255 || field == "_" || !token.IsIdentifier(field) {
+			return nil, nil, fmt.Errorf("statistics field %q must be a non-blank Go identifier of at most 255 bytes", field)
 		}
 		if known[field] {
 			return nil, nil, fmt.Errorf("repeated statistics field %q", field)
@@ -117,10 +143,13 @@ func (initialized *service) newStatistics(name string, updateInterval time.Durat
 	statistic := &Statistics{
 		name: name, fields: copiedFields, dimensions: copiedDimensions,
 		rowsPerAdd: rowsPerAdd, updateInterval: updateInterval,
-		service: initialized, onError: initialized.onError, active: make(map[string]counterRow),
+		service: initialized,
+	}
+	for index := range statistic.shards {
+		statistic.shards[index].active = make(map[counterKey]counterRow)
 	}
 	initialized.mu.Lock()
-	if initialized.ctx.Err() != nil {
+	if initialized.isClosing() {
 		initialized.mu.Unlock()
 		return nil, errors.New("EasyStatistics is closed")
 	}
@@ -137,7 +166,7 @@ func (initialized *service) newStatistics(name string, updateInterval time.Durat
 
 func (statistic *Statistics) Add(values map[string]any, delta int64) error {
 	initialized := statistic.service
-	if initialized.ctx.Err() != nil {
+	if initialized.isClosing() {
 		return errors.New("EasyStatistics is closed")
 	}
 	if len(values) != len(statistic.fields) {
@@ -156,7 +185,12 @@ func (statistic *Statistics) Add(values map[string]any, delta int64) error {
 		encoded[field] = url.QueryEscape(text)
 	}
 	timestamp := time.Now().UTC()
-	changes := make([]counterRow, 0, statistic.rowsPerAdd)
+	var localChanges [8]counterChange
+	changes := localChanges[:0]
+	if statistic.rowsPerAdd > len(localChanges) {
+		changes = make([]counterChange, 0, statistic.rowsPerAdd)
+	}
+	var selectedShards [shardNum]bool
 	for _, dimension := range statistic.dimensions {
 		ordered := make([]string, len(dimension.OrderFields))
 		for index, field := range dimension.OrderFields {
@@ -168,25 +202,44 @@ func (statistic *Statistics) Add(values map[string]any, delta int64) error {
 			if err != nil {
 				return err
 			}
-			changes = append(changes, counterRow{
-				id: recordID(statistic.name, dimension.encodedFields, encodedValues, interval, bucket), name: statistic.name,
-				dimensionID: dimension.id, dimension: dimension.encodedFields, value: encodedValues,
-				interval: interval, bucket: bucket, updated: timestamp.Unix(), counter: delta,
+			key := counterKey{dimension: dimension.encodedFields, value: encodedValues, interval: interval, bucket: bucket}
+			shardIndex := key.shardIndex()
+			selectedShards[shardIndex] = true
+			changes = append(changes, counterChange{
+				key: key, shardIndex: shardIndex,
+				row: counterRow{
+					name:        statistic.name,
+					dimensionID: dimension.id, dimension: dimension.encodedFields, value: encodedValues,
+					interval: interval, bucket: bucket, updated: timestamp.Unix(), counter: delta,
+					clearAfter: dimension.ClearAfter,
+				},
 			})
 		}
 	}
-	statistic.mu.Lock()
-	defer statistic.mu.Unlock()
-	if initialized.ctx.Err() != nil {
+	for index, selected := range selectedShards {
+		if selected {
+			statistic.shards[index].mu.Lock()
+		}
+	}
+	defer func() {
+		for index := len(selectedShards) - 1; index >= 0; index-- {
+			if selectedShards[index] {
+				statistic.shards[index].mu.Unlock()
+			}
+		}
+	}()
+	if initialized.isClosing() {
 		return errors.New("EasyStatistics is closed")
 	}
 	for _, changed := range changes {
-		previous, exists := statistic.active[changed.id]
-		changed.counter += previous.counter
-		if exists && previous.updated > changed.updated {
-			changed.updated = previous.updated
+		shard := &statistic.shards[changed.shardIndex]
+		previous, exists := shard.active[changed.key]
+		row := changed.row
+		row.counter += previous.counter
+		if exists && previous.updated > row.updated {
+			row.updated = previous.updated
 		}
-		statistic.active[changed.id] = changed
+		shard.active[changed.key] = row
 	}
 	return nil
 }
@@ -213,11 +266,12 @@ func (statistic *Statistics) Get(orderFields []OrderField, interval GroupInterva
 
 func (statistic *Statistics) get(orderFields []OrderField, interval GroupInterval, bucket int64, label string) (*Record, error) {
 	initialized := statistic.service
-	if initialized.ctx.Err() != nil {
+	if initialized.isClosing() {
 		return nil, errors.New("EasyStatistics is closed")
 	}
-	matched := false
-	for _, dimension := range statistic.dimensions {
+	var matched *Dimension
+	for index := range statistic.dimensions {
+		dimension := &statistic.dimensions[index]
 		if len(dimension.OrderFields) != len(orderFields) {
 			continue
 		}
@@ -231,29 +285,31 @@ func (statistic *Statistics) get(orderFields []OrderField, interval GroupInterva
 		if matches {
 			for _, configured := range dimension.GroupIntervals {
 				if interval == configured {
-					matched = true
+					matched = dimension
+					break
 				}
 			}
 		}
+		if matched != nil {
+			break
+		}
 	}
-	if !matched {
+	if matched == nil {
 		return nil, errors.New("query fields and interval must match a configured dimension in order")
 	}
-	encodedFields, encodedValues, normalized, err := encodeFields(orderFields)
+	encodedValues, normalized, err := encodeValues(orderFields)
 	if err != nil {
 		return nil, err
 	}
-	identity := recordID(statistic.name, encodedFields, encodedValues, interval, bucket)
-	ctx, cancel := context.WithTimeout(initialized.ctx, sqlTimeout)
-	defer cancel()
-	row, err := initialized.backend.readRow(ctx, initialized.backend.db, identity, false)
+	identity := recordID(statistic.name, matched.encodedFields, encodedValues, interval, bucket)
+	row, err := initialized.backend.getRow(identity)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, fmt.Errorf("query statistics: %w", err)
 	}
-	if row.name != statistic.name || row.dimensionID != dimensionID(statistic.name, encodedFields) || row.dimension != encodedFields || row.value != encodedValues || row.interval != interval || row.bucket != bucket {
+	if row.name != statistic.name || row.dimensionID != matched.id || row.dimension != matched.encodedFields || row.value != encodedValues || row.interval != interval || row.bucket != bucket {
 		return nil, errors.New("stored record identity does not match its key")
 	}
 	return &Record{
@@ -346,64 +402,57 @@ func parseBucket(interval GroupInterval, label string) (int64, string, error) {
 	return bucket, canonical, err
 }
 
-func (statistic *Statistics) nextBatch() (*uploadBatch, error) {
-	statistic.mu.Lock()
-	if statistic.pending != nil || len(statistic.active) == 0 {
-		batch := statistic.pending
-		statistic.mu.Unlock()
-		return batch, nil
+func (statistic *Statistics) nextBatch() *uploadBatch {
+	if statistic.pending != nil {
+		return statistic.pending
 	}
-	statistic.mu.Unlock()
+	hasRows := false
+	for index := range statistic.shards {
+		shard := &statistic.shards[index]
+		shard.mu.Lock()
+		hasRows = len(shard.active) != 0
+		shard.mu.Unlock()
+		if hasRows {
+			break
+		}
+	}
+	if !hasRows {
+		return nil
+	}
 
-	var random [32]byte
-	if _, err := rand.Read(random[:]); err != nil {
-		return nil, fmt.Errorf("create batch identity: %w", err)
+	var detached [shardNum]map[counterKey]counterRow
+	rowCount := 0
+	for index := range statistic.shards {
+		shard := &statistic.shards[index]
+		active := make(map[counterKey]counterRow)
+		shard.mu.Lock()
+		detached[index] = shard.active
+		shard.active = active
+		shard.mu.Unlock()
+		rowCount += len(detached[index])
 	}
-	batch := &uploadBatch{id: hex.EncodeToString(random[:])}
-	active := make(map[string]counterRow)
-
-	statistic.mu.Lock()
-	defer statistic.mu.Unlock()
-	if statistic.pending != nil || len(statistic.active) == 0 {
-		return statistic.pending, nil
+	batch := &uploadBatch{rows: make(map[string]counterRow, rowCount)}
+	for _, rows := range detached {
+		for _, row := range rows {
+			row.id = recordID(row.name, row.dimension, row.value, row.interval, row.bucket)
+			batch.rows[row.id] = row
+		}
 	}
-	batch.rows = statistic.active
-	statistic.active = active
 	statistic.pending = batch
-	return batch, nil
+	return batch
 }
 
 func (statistic *Statistics) reportError(err error) {
-	if err != nil && statistic.onError != nil {
-		statistic.onError(fmt.Errorf("statistics %q: %w", statistic.name, err))
+	if err != nil && statistic.service.onError != nil {
+		statistic.service.onError(fmt.Errorf("statistics %q: %w", statistic.name, err))
 	}
 }
 
-func (statistic *Statistics) upload(parent context.Context, batch *uploadBatch) error {
-	ctx, cancel := context.WithTimeout(parent, sqlTimeout)
-	defer cancel()
-	err := statistic.service.backend.cleanupBatches(ctx)
-	if err == nil {
-		for _, dimension := range statistic.dimensions {
-			if err = statistic.service.backend.cleanupDimension(ctx, statistic.name, dimension); err != nil {
-				break
-			}
-		}
-	}
-	if err == nil && batch != nil {
-		err = statistic.service.backend.submit(ctx, batch)
-	}
-	if err != nil {
-		statistic.reportError(err)
+func (statistic *Statistics) upload(batch *uploadBatch) error {
+	if err := statistic.service.backend.submit(statistic.service.ctx, batch, statistic.reportError); err != nil {
 		return err
 	}
-	if batch != nil {
-		statistic.mu.Lock()
-		if statistic.pending == batch {
-			statistic.pending = nil
-		}
-		statistic.mu.Unlock()
-	}
+	statistic.pending = nil
 	return nil
 }
 
@@ -413,32 +462,18 @@ func (statistic *Statistics) run() {
 	defer timer.Stop()
 	for {
 		select {
-		case <-statistic.service.ctx.Done():
-			for {
-				batch, err := statistic.nextBatch()
-				if err != nil {
-					statistic.reportError(err)
-					return
-				}
-				if batch == nil {
-					return
-				}
-				if err := statistic.upload(context.Background(), batch); err != nil {
-					return
-				}
-			}
+		case <-statistic.service.closing:
 		case <-timer.C:
-			batch, err := statistic.nextBatch()
-			if err != nil {
-				statistic.reportError(err)
-			} else {
-				err = statistic.upload(statistic.service.ctx, batch)
-			}
-			if err != nil {
-				timer.Reset(retryDelay)
-			} else {
-				timer.Reset(statistic.updateInterval)
-			}
 		}
+		closing := statistic.service.isClosing()
+		batch := statistic.nextBatch()
+		if batch == nil && closing {
+			return
+		}
+		if err := statistic.upload(batch); err != nil {
+			statistic.service.stop()
+			return
+		}
+		timer.Reset(statistic.updateInterval)
 	}
 }

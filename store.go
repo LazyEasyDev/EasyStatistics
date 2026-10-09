@@ -9,6 +9,8 @@ import (
 	"time"
 )
 
+const cleanupInterval = time.Minute
+
 var (
 	defaultServiceMu sync.RWMutex
 	defaultService   *service
@@ -21,19 +23,13 @@ type service struct {
 	onError    func(error)
 	mu         sync.Mutex
 	statistics map[string]*Statistics
-	closed     bool
+	closing    chan struct{}
 	workers    sync.WaitGroup
 }
 
-func Init(ctx context.Context, database *sql.DB, dialect SQLDialect, onError func(error)) error {
-	if ctx == nil {
-		return errors.New("context is required")
-	}
-	if err := ctx.Err(); err != nil {
-		return err
-	}
+func Init(database *sql.DB, dialect SQLDialect, onError func(error)) error {
 	defaultServiceMu.RLock()
-	alreadyInitialized := defaultService != nil
+	alreadyInitialized := defaultService != nil && defaultService.ctx.Err() == nil
 	defaultServiceMu.RUnlock()
 	if alreadyInitialized {
 		return errors.New("EasyStatistics is already initialized")
@@ -42,37 +38,55 @@ func Init(ctx context.Context, database *sql.DB, dialect SQLDialect, onError fun
 	if err != nil {
 		return err
 	}
-	if err := backend.ensureSchema(ctx); err != nil {
-		return err
-	}
-	initialized, err := newService(ctx, backend, onError)
-	if err != nil {
+	initialized := newService(backend, onError)
+	if err := backend.ensureSchema(initialized.ctx); err != nil {
+		initialized.cancel()
 		return err
 	}
 	defaultServiceMu.Lock()
-	if defaultService != nil {
+	if defaultService != nil && defaultService.ctx.Err() == nil {
 		defaultServiceMu.Unlock()
 		initialized.cancel()
 		return errors.New("EasyStatistics is already initialized")
 	}
+	initialized.workers.Add(1)
 	defaultService = initialized
 	defaultServiceMu.Unlock()
-	go initialized.wait()
+	go initialized.runCleanup()
 	return nil
 }
 
-func newService(parent context.Context, backend *sqlBackend, onError func(error)) (*service, error) {
-	if parent == nil {
-		return nil, errors.New("context is required")
-	}
-	if err := parent.Err(); err != nil {
-		return nil, err
-	}
-	ctx, cancel := context.WithCancel(parent)
+func newService(backend *sqlBackend, onError func(error)) *service {
+	ctx, cancel := context.WithCancel(context.Background())
 	return &service{
 		backend: backend, ctx: ctx, cancel: cancel, onError: onError,
-		statistics: make(map[string]*Statistics),
-	}, nil
+		statistics: make(map[string]*Statistics), closing: make(chan struct{}),
+	}
+}
+
+func (initialized *service) runCleanup() {
+	defer initialized.workers.Done()
+	ticker := time.NewTicker(cleanupInterval)
+	defer ticker.Stop()
+	for {
+		if initialized.isClosing() {
+			return
+		}
+		if err := initialized.backend.cleanup(initialized.ctx); err != nil {
+			if initialized.onError != nil {
+				initialized.onError(err)
+			}
+			if isClosedDatabase(err) {
+				initialized.stop()
+				return
+			}
+		}
+		select {
+		case <-initialized.closing:
+			return
+		case <-ticker.C:
+		}
+	}
 }
 
 func currentService() (*service, error) {
@@ -101,7 +115,7 @@ func GetStatistics(name string) (*Statistics, error) {
 	initialized.mu.Lock()
 	statistic := initialized.statistics[name]
 	initialized.mu.Unlock()
-	if initialized.ctx.Err() != nil {
+	if initialized.isClosing() {
 		return nil, errors.New("EasyStatistics is closed")
 	}
 	if statistic == nil {
@@ -115,35 +129,29 @@ func Close() error {
 	if err != nil {
 		return err
 	}
-	return initialized.close()
-}
-
-func Wait() error {
-	initialized, err := currentService()
-	if err != nil {
-		return err
-	}
-	return initialized.wait()
-}
-
-func (initialized *service) wait() error {
-	<-initialized.ctx.Done()
-	return initialized.close()
-}
-
-func (initialized *service) close() error {
-	initialized.mu.Lock()
-	if initialized.closed {
-		initialized.mu.Unlock()
-		return nil
-	}
-	initialized.cancel()
-	initialized.mu.Unlock()
-
-	initialized.workers.Wait()
-
-	initialized.mu.Lock()
-	initialized.closed = true
-	initialized.mu.Unlock()
+	initialized.close()
 	return nil
+}
+
+func (initialized *service) isClosing() bool {
+	select {
+	case <-initialized.closing:
+		return true
+	default:
+		return false
+	}
+}
+
+func (initialized *service) stop() {
+	initialized.mu.Lock()
+	if !initialized.isClosing() {
+		close(initialized.closing)
+	}
+	initialized.mu.Unlock()
+}
+
+func (initialized *service) close() {
+	initialized.stop()
+	initialized.workers.Wait()
+	initialized.cancel()
 }

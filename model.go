@@ -9,8 +9,44 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 )
+
+type GroupInterval string
+
+const (
+	GroupSec     GroupInterval = "SECOND"
+	GroupMinute  GroupInterval = "MINUTE"
+	GroupHour    GroupInterval = "HOUR"
+	GroupDay     GroupInterval = "DAY"
+	GroupWeek    GroupInterval = "WEEK"
+	GroupMonth   GroupInterval = "MONTH"
+	GroupYear    GroupInterval = "YEAR"
+	GroupForever GroupInterval = "FOREVER"
+)
+
+type Dimension struct {
+	OrderFields    []string
+	GroupIntervals []GroupInterval
+	ClearAfter     time.Duration
+	encodedFields  string
+	id             string
+}
+
+type OrderField struct {
+	Name  string
+	Value any
+}
+
+type Record struct {
+	Name           string
+	OrderFields    []OrderField
+	GroupInterval  GroupInterval
+	GroupedTimeStr string
+	LastUpdateTime time.Time
+	Counter        int64
+}
 
 func normalizeValue(value any) (string, error) {
 	if value == nil {
@@ -43,25 +79,18 @@ func encodeSequence(parts []string) string {
 	return strings.Join(escaped, ":")
 }
 
-func encodeFields(fields []OrderField) (string, string, []OrderField, error) {
-	names := make([]string, len(fields))
+func encodeValues(fields []OrderField) (string, []OrderField, error) {
 	values := make([]string, len(fields))
 	normalized := make([]OrderField, len(fields))
-	seen := make(map[string]bool, len(fields))
 	for index, field := range fields {
-		if field.Name == "" || !utf8.ValidString(field.Name) || seen[field.Name] {
-			return "", "", nil, fmt.Errorf("invalid or repeated dimension field %q", field.Name)
-		}
-		seen[field.Name] = true
 		text, err := normalizeValue(field.Value)
 		if err != nil {
-			return "", "", nil, fmt.Errorf("field %q: %w", field.Name, err)
+			return "", nil, fmt.Errorf("field %q: %w", field.Name, err)
 		}
-		names[index] = field.Name
 		values[index] = text
 		normalized[index] = OrderField{Name: field.Name, Value: text}
 	}
-	return encodeSequence(names), encodeSequence(values), normalized, nil
+	return encodeSequence(values), normalized, nil
 }
 
 func dimensionID(name, fields string) string {
@@ -71,7 +100,9 @@ func dimensionID(name, fields string) string {
 }
 
 func recordID(name, dimension, value string, interval GroupInterval, bucket int64) string {
-	identity, _ := json.Marshal([]string{name, dimension, value, string(interval), strconv.FormatInt(bucket, 10)})
+	identity, _ := json.Marshal([5]string{name, dimension, value, string(interval), strconv.FormatInt(bucket, 10)})
 	digest := sha256.Sum256(identity)
-	return hex.EncodeToString(digest[:])
+	var encoded [sha256.Size * 2]byte
+	hex.Encode(encoded[:], digest[:])
+	return string(encoded[:])
 }
