@@ -2,9 +2,11 @@ package EasyStatistics
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
 	"errors"
 	"fmt"
+	"math/big"
 	"sync"
 	"time"
 )
@@ -28,6 +30,9 @@ type service struct {
 }
 
 func Init(database *sql.DB, dialect SQLDialect, onError func(error)) error {
+	if onError == nil {
+		return errors.New("error callback is required")
+	}
 	defaultServiceMu.RLock()
 	alreadyInitialized := defaultService != nil && defaultService.ctx.Err() == nil
 	defaultServiceMu.RUnlock()
@@ -35,6 +40,10 @@ func Init(database *sql.DB, dialect SQLDialect, onError func(error)) error {
 		return errors.New("EasyStatistics is already initialized")
 	}
 	backend, err := newSQLBackend(database, dialect)
+	if err != nil {
+		return err
+	}
+	cleanupDelay, err := randomCleanupDelay()
 	if err != nil {
 		return err
 	}
@@ -52,7 +61,7 @@ func Init(database *sql.DB, dialect SQLDialect, onError func(error)) error {
 	initialized.workers.Add(1)
 	defaultService = initialized
 	defaultServiceMu.Unlock()
-	go initialized.runCleanup()
+	go initialized.runCleanup(cleanupDelay)
 	return nil
 }
 
@@ -64,21 +73,57 @@ func newService(backend *sqlBackend, onError func(error)) *service {
 	}
 }
 
-func (initialized *service) runCleanup() {
+func randomCleanupDelay() (time.Duration, error) {
+	seconds, err := rand.Int(rand.Reader, big.NewInt(int64(cleanupInterval/time.Second)))
+	if err != nil {
+		return 0, fmt.Errorf("randomize statistics cleanup schedule: %w", err)
+	}
+	return time.Duration(seconds.Int64()+1) * time.Second, nil
+}
+
+func (initialized *service) runCleanup(initialDelay time.Duration) {
 	defer initialized.workers.Done()
+	timer := time.NewTimer(initialDelay)
+	defer timer.Stop()
+	select {
+	case <-initialized.closing:
+		return
+	case <-timer.C:
+	}
 	ticker := time.NewTicker(cleanupInterval)
 	defer ticker.Stop()
 	for {
-		if initialized.isClosing() {
-			return
-		}
-		if err := initialized.backend.cleanup(initialized.ctx); err != nil {
-			if initialized.onError != nil {
-				initialized.onError(err)
-			}
-			if isClosedDatabase(err) {
-				initialized.stop()
+		cutoff := time.Now().UTC().Unix()
+		for {
+			if initialized.isClosing() {
 				return
+			}
+			affected, err := initialized.backend.cleanup(initialized.ctx, cutoff)
+			if err != nil {
+				initialized.onError(err)
+				if isClosedDatabase(err) {
+					initialized.stop()
+					return
+				}
+				break
+			}
+			if affected < 0 || affected > cleanupBatchSize {
+				initialized.onError(fmt.Errorf("invalid statistics cleanup row count: %d", affected))
+				break
+			}
+			if affected < cleanupBatchSize {
+				if initialized.isClosing() {
+					return
+				}
+				err = initialized.backend.cleanupBatches(initialized.ctx, cutoff-int64(batchRetention/time.Second))
+				if err != nil {
+					initialized.onError(err)
+					if isClosedDatabase(err) {
+						initialized.stop()
+						return
+					}
+				}
+				break
 			}
 		}
 		select {

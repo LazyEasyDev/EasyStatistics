@@ -433,7 +433,7 @@ func (statistic *Statistics) nextBatch() *uploadBatch {
 }
 
 func (statistic *Statistics) reportError(err error) {
-	if err != nil && statistic.service.onError != nil {
+	if err != nil {
 		statistic.service.onError(fmt.Errorf("statistics %q: %w", statistic.name, err))
 	}
 }

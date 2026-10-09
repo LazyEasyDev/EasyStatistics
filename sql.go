@@ -12,10 +12,11 @@ import (
 )
 
 const (
-	miniBatchSize  = 500
-	retryDelay     = 10 * time.Second
-	sqlTimeout     = 60 * time.Second
-	batchRetention = 30 * 24 * time.Hour
+	miniBatchSize    = 500
+	cleanupBatchSize = 500
+	retryDelay       = 10 * time.Second
+	sqlTimeout       = 60 * time.Second
+	batchRetention   = 30 * 24 * time.Hour
 )
 
 type counterRow struct {
@@ -88,7 +89,29 @@ func (backend *sqlBackend) ensureSchema(ctx context.Context) error {
 			return fmt.Errorf("validate statistics schema: %w", err)
 		}
 	}
-	return nil
+	return backend.ensureExpiryIndex(ctx)
+}
+
+func (backend *sqlBackend) ensureExpiryIndex(ctx context.Context) error {
+	query := backend.dialect.expiryIndexQuery()
+	var count int
+	if err := backend.db.QueryRowContext(ctx, query).Scan(&count); err != nil {
+		return fmt.Errorf("check statistics expiry index: %w", err)
+	}
+	if count > 0 {
+		return nil
+	}
+	_, createError := backend.db.ExecContext(ctx, backend.dialect.createExpiryIndex())
+	if err := backend.db.QueryRowContext(ctx, query).Scan(&count); err != nil {
+		return fmt.Errorf("validate statistics expiry index: %w", errors.Join(createError, err))
+	}
+	if count > 0 {
+		return nil
+	}
+	if createError != nil {
+		return fmt.Errorf("create statistics expiry index: %w", createError)
+	}
+	return errors.New("statistics expiry index was not created")
 }
 
 func (backend *sqlBackend) schemaReady(ctx context.Context, index int) error {
@@ -151,7 +174,7 @@ func (backend *sqlBackend) applyBatch(ctx context.Context, batch *miniBatch) err
 	if !errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("check statistics batch: %w", err)
 	}
-	if _, err := transaction.ExecContext(ctx, backend.dialect.insertBatch(), batch.id); err != nil {
+	if _, err := transaction.ExecContext(ctx, backend.dialect.insertBatch(), batch.id, time.Now().UTC().Unix()); err != nil {
 		return fmt.Errorf("register statistics batch: %w", err)
 	}
 	for _, incoming := range batch.rows {
@@ -181,9 +204,7 @@ func (backend *sqlBackend) submit(parent context.Context, batch *uploadBatch, on
 		if err == nil {
 			continue
 		}
-		if onError != nil {
-			onError(err)
-		}
+		onError(err)
 		if isClosedDatabase(err) {
 			return err
 		}
@@ -243,13 +264,24 @@ func (backend *sqlBackend) submitOnce(ctx context.Context, batch *uploadBatch) e
 	return nil
 }
 
-func (backend *sqlBackend) cleanup(parent context.Context) error {
+func (backend *sqlBackend) cleanup(parent context.Context, cutoff int64) (int64, error) {
 	ctx, cancel := context.WithTimeout(parent, sqlTimeout)
 	defer cancel()
-	if _, err := backend.db.ExecContext(ctx, backend.dialect.pruneRecords()); err != nil {
-		return fmt.Errorf("remove expired statistics records: %w", err)
+	result, err := backend.db.ExecContext(ctx, backend.dialect.pruneRecords(), cutoff)
+	if err != nil {
+		return 0, fmt.Errorf("remove expired statistics records: %w", err)
 	}
-	if _, err := backend.db.ExecContext(ctx, backend.dialect.pruneBatches(), int64(batchRetention/time.Second)); err != nil {
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("count removed statistics records: %w", err)
+	}
+	return affected, nil
+}
+
+func (backend *sqlBackend) cleanupBatches(parent context.Context, cutoff int64) error {
+	ctx, cancel := context.WithTimeout(parent, sqlTimeout)
+	defer cancel()
+	if _, err := backend.db.ExecContext(ctx, backend.dialect.pruneBatches(), cutoff); err != nil {
 		return fmt.Errorf("remove expired statistics batches: %w", err)
 	}
 	return nil

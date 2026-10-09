@@ -199,21 +199,23 @@ Set `Dimension.ClearAfter` to make persisted records eligible for deletion after
 
 Every insert or update stores `expire_time = last_update_time + ClearAfter` in SQL, using Unix seconds and the retained latest addition timestamp. With `ClearAfter == 0`, it stores `expire_time = 0`, which means never expire. Delayed uploads do not move `last_update_time` backwards or extend expiry merely because they were uploaded later.
 
-One service-wide cleanup worker runs at startup and every **24 hours**, even with no registered statistics. The interval is measured from worker startup, not tied to midnight. It uses the database clock to delete rows where `expire_time > 0` and `expire_time <= current time`, and also prunes old batch markers. Expiry survives process restarts and does not depend on re-registering the original dimension. No cleanup runs while all service processes are stopped; it resumes at startup.
+One service-wide cleanup worker runs per process, even with no registered statistics. **There is no immediate startup cleanup.** Each successful initialization chooses an independent random first delay between **1 second and 24 hours**, then repeats every **24 hours** from that first trigger, not at midnight. This staggers processes sharing the same tables but does not guarantee that cleaners never overlap. No cleanup runs while all service processes are stopped; restarting a process chooses a new delay, so frequent restarts can postpone cleanup.
+
+Each sweep captures the application-server time once, using the same clock as `Add`, then deletes rows where `expire_time > 0` and `expire_time <= that cutoff` in batches of at most **500 rows**. Every batch commits independently. The worker continues until a successful batch deletes fewer than 500 rows; an exact multiple requires one final empty batch. There is no whole-sweep row or runtime limit. Rows becoming expired after the cutoff wait for a later sweep, and deletion rechecks expiry so refreshed rows are not removed merely because they were previously eligible. Batch-marker creation also uses application-server time; markers older than 30 days at the same sweep cutoff are pruned after record cleanup. Persisted expiry does not depend on re-registering the original dimension.
 
 Expiry is **best-effort cleanup**, not a strict validity deadline. An expired row remains queryable until deleted. Daily sweeps can leave an expired row stored for nearly another day, or longer if cleanup fails. An update before deletion adds to the existing counter and refreshes expiry; an update after deletion creates a new counter. Both outcomes are intentional. Buffered rows can also recreate a deleted record.
 
-Retention applies to every value and interval in the dimension, including `GroupForever`, and is based on inactivity rather than bucket age. A changed `ClearAfter` policy applies when a row is written again; registration does not rewrite existing deadlines. Keep application and database clocks synchronized, and use consistent policies across processes.
+Retention applies to every value and interval in the dimension, including `GroupForever`, and is based on inactivity rather than bucket age. A changed `ClearAfter` policy applies when a row is written again; registration does not rewrite existing deadlines. Keep application-server clocks synchronized across processes, and use consistent policies. Timestamps remain Unix seconds and buckets remain UTC; the database clock is not used.
 
-Each cleanup sweep has a **60-second SQL timeout**. Failures are reported through the error callback and tried again on the next scheduled sweep, without blocking uploads. `Close` stops scheduling sweeps and waits for any ongoing sweep to finish.
+Each deletion batch and marker pruning have separate **60-second SQL timeout contexts**; this is not a timeout for the whole sweep or a guarantee of immediate server-side statement cancellation. A failed sweep stops, reports the error callback, and retries on the next scheduled sweep; already committed deletions remain committed. Cleanup runs independently of upload workers, although SQL locks and database load can still affect uploads. `Close` wakes a waiting cleaner, waits for an in-flight cleanup operation, and prevents further cleanup batches from starting.
 
 ### Handle Errors
 
-`Init` accepts a `func(error)` for worker failures; pass `nil` to disable notifications. The callback receives batch-creation, upload, and confirmed batch-marker-deletion failures wrapped with the statistic name. Service-wide cleanup failures are reported without a statistic name.
+`Init` requires a non-nil `func(error)` for worker failures and returns an error if the callback is nil. The callback receives batch-creation, upload, and confirmed batch-marker-deletion failures wrapped with the statistic name. Service-wide cleanup failures are reported without a statistic name.
 
 The callback runs synchronously, outside the buffer and service locks. Different workers may call it concurrently. Keep it quick and protect shared application state. **Do not call `Close` synchronously from the callback**, because it waits for that worker to exit.
 
-Initialization, registration, lookup, `Add`, and query errors return directly to their callers. Worker errors are reported only through `onError`; they are not stored or returned by `Close`. A nil callback discards these notifications. The library does not expose shared error sentinels or a latest-error status.
+Initialization, registration, lookup, `Add`, and query errors return directly to their callers. Worker errors are reported only through `onError`; they are not stored or returned by `Close`. The library does not expose shared error sentinels or a latest-error status.
 
 ### Shut Down
 
@@ -227,7 +229,7 @@ Call `EasyStatistics.Close()` explicitly during application shutdown. It stops a
 | `Init` while running or draining | Returns an error |
 | `Init` after completed `Close` | Creates a fresh service and statistics registry |
 
-The service owns one internal context for schema setup, uploads, and cleanup. It remains alive throughout draining and is canceled only after workers finish. `Close` stops scheduling cleanup sweeps and waits for any ongoing sweep while statistics workers drain. Those workers finish pending and active snapshots in order through the same retrying submission logic used during normal operation. Failed mini-batch attempts are reported and retried after **10 seconds**, with a fresh timeout per attempt. Confirmed mini-batches are not replayed.
+The service owns one internal context for schema setup, uploads, and cleanup. It remains alive throughout draining and is canceled only after workers finish. `Close` stops scheduling cleanup sweeps and waits for an in-flight cleanup operation without starting another batch, while statistics workers drain. Those workers finish pending and active snapshots in order through the same retrying submission logic used during normal operation. Failed mini-batch attempts are reported and retried after **10 seconds**, with a fresh timeout per attempt. Confirmed mini-batches are not replayed.
 
 There is **no overall shutdown deadline**. An unavailable server, invalid schema, or another persistent upload failure can make shutdown wait indefinitely. If a worker observes that the `*sql.DB` pool is permanently closed, it reports the failure through `onError`, stops new work, and exits. Unuploaded data stays in memory and is lost when the process exits.
 
@@ -252,9 +254,11 @@ Pass the dialect matching your database to `Init` and import its driver in your 
 | PostgreSQL-compatible GaussDB | `SQLGaussDB` |
 | Oracle | `SQLOracle` |
 
-`Init` checks connectivity, creates missing tables, and checks that required columns are readable. It does not migrate existing tables or fully validate their types and constraints. The database account needs table-creation permission for initial setup and read/write/delete permissions during operation.
+`Init` checks connectivity, creates missing tables, checks that required columns are readable, and ensures a nonunique B-tree expiry index whose leading column is `expire_time`. A suitable existing index is reused; otherwise it creates `easy_statistics_expire_idx`, including on an existing table. Index creation races between processes are rechecked against the database catalog. The account needs schema-metadata access, table/index creation permission when those objects are missing, and read/write/delete permissions during operation.
 
-The counter table requires the `expire_time` column. Existing tables created without it must be updated separately before initialization; there is no automatic schema migration.
+Schema setup retains its **60-second SQL timeout**. Creating an index on a large existing table can take longer or block concurrent work; precreate a suitable nonunique expiry index during planned database maintenance before upgrading. Initialization returns an error if the index cannot be created or verified; it does not drop conflicting or invalid indexes automatically.
+
+The counter table requires the `expire_time` column. Existing tables created without it must be updated separately before initialization. Apart from ensuring the expiry index, the library does not migrate existing columns or fully validate their types and constraints.
 
 The Oracle insert explicitly stores an empty dimension value as a non-null empty CLOB rather than SQL NULL.
 
@@ -281,6 +285,8 @@ Only one service can be running or draining at a time. After `Close` completes, 
 ## Design Notes
 
 Dialect helpers in [dialect.go](dialect.go) generate SQL using only `SQLDialect`; they do not depend on the database backend. [sql.go](sql.go) owns SQL execution, transactions, batch identity, timeouts, and upload retries. [statistics.go](statistics.go) owns buffering, the normal update interval, and final draining. [store.go](store.go) owns the service lifecycle and global cleanup worker.
+
+`runCleanup` owns cleanup scheduling, the fixed application-time cutoff for each sweep, the repeat-until-short-batch loop, error callbacks, and shutdown checks. The SQL backend's `cleanup` method attempts exactly one deletion batch and returns its affected-row count and error; it does not schedule, repeat, or inspect the service's closing signal. Old batch-marker pruning is a separate SQL operation called by the worker.
 
 ### Buffering And Retries
 

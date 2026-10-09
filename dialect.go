@@ -19,8 +19,9 @@ const (
 )
 
 const (
-	tableName      = "easy_statistics"
-	batchTableName = "easy_statistics_batches"
+	tableName       = "easy_statistics"
+	batchTableName  = "easy_statistics_batches"
+	expiryIndexName = "easy_statistics_expire_idx"
 )
 
 func schemaFor(dialect SQLDialect) ([]string, error) {
@@ -176,23 +177,8 @@ func (dialect SQLDialect) selectBatch() string {
 	return "SELECT " + dialect.quote("batch_id") + " FROM " + dialect.quote(batchTableName) + " WHERE " + dialect.quote("batch_id") + " = " + dialect.bind(1)
 }
 
-func (dialect SQLDialect) currentUnixTime() string {
-	switch dialect {
-	case SQLPostgreSQL, SQLGaussDB:
-		return "CAST(FLOOR(EXTRACT(EPOCH FROM CURRENT_TIMESTAMP)) AS BIGINT)"
-	case SQLMySQL, SQLMariaDB, SQLTiDB:
-		return "UNIX_TIMESTAMP()"
-	case SQLSQLite:
-		return "CAST(strftime('%s', 'now') AS INTEGER)"
-	case SQLServer:
-		return "DATEDIFF_BIG(SECOND, CAST('1970-01-01T00:00:00' AS DATETIME2), SYSUTCDATETIME())"
-	default:
-		return "FLOOR((CAST(SYS_EXTRACT_UTC(SYSTIMESTAMP) AS DATE) - DATE '1970-01-01') * 86400)"
-	}
-}
-
 func (dialect SQLDialect) insertBatch() string {
-	return "INSERT INTO " + dialect.quote(batchTableName) + " (" + dialect.columns("batch_id", "created_unix_time") + ") VALUES (" + dialect.bind(1) + ", " + dialect.currentUnixTime() + ")"
+	return dialect.insert(batchTableName, "batch_id", "created_unix_time")
 }
 
 func (dialect SQLDialect) deleteBatch() string {
@@ -200,11 +186,72 @@ func (dialect SQLDialect) deleteBatch() string {
 }
 
 func (dialect SQLDialect) pruneBatches() string {
-	return "DELETE FROM " + dialect.quote(batchTableName) + " WHERE " + dialect.quote("created_unix_time") + " < " + dialect.currentUnixTime() + " - " + dialect.bind(1)
+	return "DELETE FROM " + dialect.quote(batchTableName) + " WHERE " + dialect.quote("created_unix_time") + " < " + dialect.bind(1)
 }
 
 func (dialect SQLDialect) pruneRecords() string {
-	return "DELETE FROM " + dialect.quote(tableName) + " WHERE " + dialect.quote("expire_time") + " > 0 AND " + dialect.quote("expire_time") + " <= " + dialect.currentUnixTime()
+	table := dialect.quote(tableName)
+	expiry := dialect.quote("expire_time")
+	identity := dialect.quote("record_id")
+	cutoff := dialect.bind(1)
+	if dialect == SQLSQLite {
+		cutoff = "?1"
+	}
+	predicate := expiry + " > 0 AND " + expiry + " <= " + cutoff
+	query := "DELETE FROM " + table + " WHERE " + predicate
+	switch dialect {
+	case SQLMySQL, SQLMariaDB, SQLTiDB:
+		return query + " ORDER BY " + expiry + fmt.Sprintf(" LIMIT %d", cleanupBatchSize)
+	case SQLServer:
+		return fmt.Sprintf("DELETE TOP (%d) FROM ", cleanupBatchSize) + table + " WHERE " + predicate
+	case SQLOracle:
+		return query + fmt.Sprintf(" AND ROWNUM <= %d", cleanupBatchSize)
+	case SQLPostgreSQL, SQLGaussDB, SQLSQLite:
+		return query + " AND " + identity + " IN (SELECT " + identity + " FROM " + table + " WHERE " + predicate +
+			" ORDER BY " + expiry + fmt.Sprintf(" LIMIT %d)", cleanupBatchSize)
+	default:
+		return ""
+	}
+}
+
+func (dialect SQLDialect) createExpiryIndex() string {
+	return "CREATE INDEX " + dialect.quote(expiryIndexName) + " ON " + dialect.quote(tableName) + " (" + dialect.quote("expire_time") + ")"
+}
+
+func (dialect SQLDialect) expiryIndexQuery() string {
+	switch dialect {
+	case SQLMySQL, SQLMariaDB, SQLTiDB:
+		return `SELECT COUNT(*) FROM information_schema.STATISTICS
+WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'easy_statistics'
+AND COLUMN_NAME = 'expire_time' AND SEQ_IN_INDEX = 1 AND NON_UNIQUE = 1 AND INDEX_TYPE = 'BTREE'`
+	case SQLPostgreSQL, SQLGaussDB:
+		return `SELECT COUNT(*) FROM pg_index AS indexes
+JOIN pg_class AS relations ON relations.oid = indexes.indexrelid
+JOIN pg_am AS methods ON methods.oid = relations.relam
+JOIN pg_attribute AS fields ON fields.attrelid = indexes.indrelid AND fields.attnum = indexes.indkey[0]
+WHERE indexes.indrelid = 'easy_statistics'::regclass AND fields.attname = 'expire_time'
+AND NOT indexes.indisunique AND indexes.indisvalid AND indexes.indpred IS NULL
+AND methods.amname IN ('btree', 'ubtree')`
+	case SQLSQLite:
+		return `SELECT COUNT(*) FROM pragma_index_list('easy_statistics') AS indexes
+JOIN pragma_index_info(indexes.name) AS fields ON fields.seqno = 0
+WHERE fields.name = 'expire_time' AND indexes."unique" = 0 AND indexes.partial = 0`
+	case SQLServer:
+		return `SELECT COUNT(*) FROM sys.indexes AS indexes
+JOIN sys.index_columns AS keys ON keys.object_id = indexes.object_id AND keys.index_id = indexes.index_id
+JOIN sys.columns AS fields ON fields.object_id = keys.object_id AND fields.column_id = keys.column_id
+WHERE indexes.object_id = OBJECT_ID(N'easy_statistics', N'U') AND fields.name = N'expire_time'
+AND keys.key_ordinal = 1 AND indexes.is_unique = 0 AND indexes.is_disabled = 0
+AND indexes.is_hypothetical = 0 AND indexes.has_filter = 0 AND indexes.type IN (1, 2)`
+	case SQLOracle:
+		return `SELECT COUNT(*) FROM USER_INDEXES indexes
+JOIN USER_IND_COLUMNS fields ON fields.INDEX_NAME = indexes.INDEX_NAME AND fields.TABLE_NAME = indexes.TABLE_NAME
+WHERE indexes.TABLE_NAME = 'easy_statistics' AND fields.COLUMN_NAME = 'expire_time'
+AND fields.COLUMN_POSITION = 1 AND indexes.UNIQUENESS = 'NONUNIQUE'
+AND indexes.STATUS = 'VALID' AND indexes.INDEX_TYPE = 'NORMAL'`
+	default:
+		return ""
+	}
 }
 
 func (dialect SQLDialect) insertRecord() string {
