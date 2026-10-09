@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	mathrand "math/rand"
 	"sort"
 	"time"
 )
@@ -14,7 +15,6 @@ import (
 const (
 	miniBatchSize    = 500
 	cleanupBatchSize = 500
-	retryDelay       = 10 * time.Second
 	sqlTimeout       = 60 * time.Second
 	batchRetention   = 30 * 24 * time.Hour
 )
@@ -207,6 +207,7 @@ func (backend *sqlBackend) submit(parent context.Context, batch *uploadBatch) er
 		if isClosedDatabase(err) {
 			return err
 		}
+		retryDelay := time.Duration(2+mathrand.Intn(9)) * time.Second
 		if err := waitDelay(parent, retryDelay); err != nil {
 			return err
 		}
