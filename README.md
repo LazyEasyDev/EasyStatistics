@@ -2,6 +2,10 @@
 
 Buffered, SQL-backed counters for Go applications. Add values in memory, group them by fields and UTC time buckets, and let background workers upload the accumulated changes.
 
+EasyStatistics is intended for **coarse-grained SQL statistics**, with **day, week, month, year, and forever** grouping. Second, minute, and hour buckets are intentionally unsupported to limit the number of persisted time buckets and keep SQL table growth manageable. High-cardinality dimensions and long retention can still produce large tables.
+
+For detailed second-, minute-, or hour-level statistics, choose a dedicated time-series or analytics project, such as a suitable NoSQL-based solution.
+
 The library requires **Go 1.20 or later** and uses only the standard library. You supply a `*sql.DB` and a compatible database driver; the driver may require a newer Go version.
 
 ## Install
@@ -177,11 +181,10 @@ All queries read **uploaded SQL data only**. A missing row returns `(nil, nil)`;
 
 ### Choose Time Buckets
 
+Only the following groups are supported. Registration and queries reject `"SECOND"`, `"MINUTE"`, and `"HOUR"`, even when explicitly cast to `GroupInterval`. Grouping is independent of `updateInterval`: short upload intervals remain supported and do not create finer-grained buckets.
+
 | Constant | Example For `Get` |
 | --- | --- |
-| `GroupSec` | `2026-10-07T12:34:56Z` |
-| `GroupMinute` | `2026-10-07T12:34Z` |
-| `GroupHour` | `2026-10-07T12Z` |
 | `GroupDay` | `2026-10-07` |
 | `GroupWeek` | `2026-W41` |
 | `GroupMonth` | `2026-10` |
@@ -196,9 +199,9 @@ Set `Dimension.ClearAfter` to make persisted records eligible for deletion after
 
 Every insert or update stores `expire_time = last_update_time + ClearAfter` in SQL, using Unix seconds and the retained latest addition timestamp. With `ClearAfter == 0`, it stores `expire_time = 0`, which means never expire. Delayed uploads do not move `last_update_time` backwards or extend expiry merely because they were uploaded later.
 
-One service-wide cleanup worker runs at startup and every **minute**, even with no registered statistics. It uses the database clock to delete rows where `expire_time > 0` and `expire_time <= current time`, and also prunes old batch markers. Expiry survives process restarts and does not depend on re-registering the original dimension. No cleanup runs while all service processes are stopped; it resumes at startup.
+One service-wide cleanup worker runs at startup and every **24 hours**, even with no registered statistics. The interval is measured from worker startup, not tied to midnight. It uses the database clock to delete rows where `expire_time > 0` and `expire_time <= current time`, and also prunes old batch markers. Expiry survives process restarts and does not depend on re-registering the original dimension. No cleanup runs while all service processes are stopped; it resumes at startup.
 
-Expiry is **best-effort cleanup**, not a strict validity deadline. An expired row remains queryable until deleted. An update before deletion adds to the existing counter and refreshes expiry; an update after deletion creates a new counter. Both outcomes are intentional. Buffered rows can also recreate a deleted record.
+Expiry is **best-effort cleanup**, not a strict validity deadline. An expired row remains queryable until deleted. Daily sweeps can leave an expired row stored for nearly another day, or longer if cleanup fails. An update before deletion adds to the existing counter and refreshes expiry; an update after deletion creates a new counter. Both outcomes are intentional. Buffered rows can also recreate a deleted record.
 
 Retention applies to every value and interval in the dimension, including `GroupForever`, and is based on inactivity rather than bucket age. A changed `ClearAfter` policy applies when a row is written again; registration does not rewrite existing deadlines. Keep application and database clocks synchronized, and use consistent policies across processes.
 
@@ -307,7 +310,7 @@ Failed attempts retry inside the SQL backend after **10 seconds** until successf
 
 The SQL backend gives schema setup, each cleanup sweep, and each mini-batch attempt a **60-second child context** of the internal service context. Queries use their own independent 60-second contexts. Cleanup is independent of uploads and cannot consume a mini-batch's write timeout. Each following mini-batch and every retry receives a fresh budget; there is no overall snapshot deadline. Timeouts require driver cancellation support to be effective.
 
-Uploads perform no retention cleanup. The single service-wide cleanup worker uses `cleanupInterval` in [store.go](store.go), which defaults to one minute. It deletes expired records directly with a SQL predicate instead of selecting IDs for later deletion. Multiple service processes may run sweeps against the same database; deletion always checks the currently stored deadline.
+Uploads perform no retention cleanup. The single service-wide cleanup worker uses `cleanupInterval` in [store.go](store.go), set to 24 hours. It deletes expired records directly with a SQL predicate instead of selecting IDs for later deletion. Multiple service processes may run sweeps against the same database; deletion always checks the currently stored deadline.
 
 ### Storage And Batch Identity
 

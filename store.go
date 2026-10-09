@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-const cleanupInterval = time.Minute
+const cleanupInterval = 24 * time.Hour
 
 var (
 	defaultServiceMu sync.RWMutex

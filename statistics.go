@@ -324,15 +324,6 @@ func bucketFor(interval GroupInterval, timestamp time.Time) (int64, string, erro
 	var start time.Time
 	var label string
 	switch interval {
-	case GroupSec:
-		start = time.Unix(timestamp.Unix(), 0).UTC()
-		label = start.Format("2006-01-02T15:04:05Z")
-	case GroupMinute:
-		start = time.Date(year, month, day, timestamp.Hour(), timestamp.Minute(), 0, 0, time.UTC)
-		label = start.Format("2006-01-02T15:04Z")
-	case GroupHour:
-		start = time.Date(year, month, day, timestamp.Hour(), 0, 0, 0, time.UTC)
-		label = start.Format("2006-01-02T15Z")
 	case GroupDay:
 		start = time.Date(year, month, day, 0, 0, 0, 0, time.UTC)
 		label = start.Format("2006-01-02")
@@ -383,8 +374,7 @@ func parseBucket(interval GroupInterval, label string) (int64, string, error) {
 		return bucket, canonical, err
 	}
 	layouts := map[GroupInterval]string{
-		GroupSec: "2006-01-02T15:04:05Z", GroupMinute: "2006-01-02T15:04Z",
-		GroupHour: "2006-01-02T15Z", GroupDay: "2006-01-02",
+		GroupDay:   "2006-01-02",
 		GroupMonth: "2006-01", GroupYear: "2006",
 	}
 	layout, exists := layouts[interval]

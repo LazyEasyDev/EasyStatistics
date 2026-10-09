@@ -16,9 +16,6 @@ import (
 type GroupInterval string
 
 const (
-	GroupSec     GroupInterval = "SECOND"
-	GroupMinute  GroupInterval = "MINUTE"
-	GroupHour    GroupInterval = "HOUR"
 	GroupDay     GroupInterval = "DAY"
 	GroupWeek    GroupInterval = "WEEK"
 	GroupMonth   GroupInterval = "MONTH"
