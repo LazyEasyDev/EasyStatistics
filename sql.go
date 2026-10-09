@@ -190,7 +190,7 @@ func (backend *sqlBackend) applyBatch(ctx context.Context, batch *miniBatch) err
 	return nil
 }
 
-func (backend *sqlBackend) submit(parent context.Context, batch *uploadBatch, onError func(error)) error {
+func (backend *sqlBackend) submit(parent context.Context, batch *uploadBatch) error {
 	for {
 		if err := parent.Err(); err != nil {
 			return err
@@ -204,7 +204,6 @@ func (backend *sqlBackend) submit(parent context.Context, batch *uploadBatch, on
 		if err == nil {
 			continue
 		}
-		onError(err)
 		if isClosedDatabase(err) {
 			return err
 		}

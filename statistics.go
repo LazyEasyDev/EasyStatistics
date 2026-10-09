@@ -111,18 +111,20 @@ func validateDefinition(name string, updateInterval time.Duration, fields []stri
 		}
 		seenDimensions[identity] = true
 		seenIntervals := make(map[GroupInterval]bool, len(dimension.GroupIntervals))
+		intervals := make([]GroupInterval, 0, len(dimension.GroupIntervals))
 		for _, interval := range dimension.GroupIntervals {
+			if seenIntervals[interval] {
+				continue
+			}
 			if _, _, err := bucketFor(interval, time.Unix(0, 0)); err != nil {
 				return nil, nil, err
 			}
-			if seenIntervals[interval] {
-				return nil, nil, fmt.Errorf("repeated group interval %q", interval)
-			}
 			seenIntervals[interval] = true
+			intervals = append(intervals, interval)
 		}
 		copied[index] = Dimension{
 			OrderFields:    append([]string(nil), dimension.OrderFields...),
-			GroupIntervals: append([]GroupInterval(nil), dimension.GroupIntervals...),
+			GroupIntervals: intervals,
 			ClearAfter:     dimension.ClearAfter,
 			encodedFields:  identity,
 			id:             dimensionID(name, identity),
@@ -167,7 +169,7 @@ func (initialized *service) newStatistics(name string, updateInterval time.Durat
 func (statistic *Statistics) Add(values map[string]any, delta int64) error {
 	initialized := statistic.service
 	if initialized.isClosing() {
-		return errors.New("EasyStatistics is closed")
+		return nil
 	}
 	if len(values) != len(statistic.fields) {
 		return errors.New("Add requires exactly the declared statistics fields")
@@ -229,7 +231,7 @@ func (statistic *Statistics) Add(values map[string]any, delta int64) error {
 		}
 	}()
 	if initialized.isClosing() {
-		return errors.New("EasyStatistics is closed")
+		return nil
 	}
 	for _, changed := range changes {
 		shard := &statistic.shards[changed.shardIndex]
@@ -432,14 +434,8 @@ func (statistic *Statistics) nextBatch() *uploadBatch {
 	return batch
 }
 
-func (statistic *Statistics) reportError(err error) {
-	if err != nil {
-		statistic.service.onError(fmt.Errorf("statistics %q: %w", statistic.name, err))
-	}
-}
-
 func (statistic *Statistics) upload(batch *uploadBatch) error {
-	if err := statistic.service.backend.submit(statistic.service.ctx, batch, statistic.reportError); err != nil {
+	if err := statistic.service.backend.submit(statistic.service.ctx, batch); err != nil {
 		return err
 	}
 	statistic.pending = nil

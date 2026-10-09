@@ -22,17 +22,13 @@ type service struct {
 	backend    *sqlBackend
 	ctx        context.Context
 	cancel     context.CancelFunc
-	onError    func(error)
 	mu         sync.Mutex
 	statistics map[string]*Statistics
 	closing    chan struct{}
 	workers    sync.WaitGroup
 }
 
-func Init(database *sql.DB, dialect SQLDialect, onError func(error)) error {
-	if onError == nil {
-		return errors.New("error callback is required")
-	}
+func Init(database *sql.DB, dialect SQLDialect) error {
 	defaultServiceMu.RLock()
 	alreadyInitialized := defaultService != nil && defaultService.ctx.Err() == nil
 	defaultServiceMu.RUnlock()
@@ -47,7 +43,7 @@ func Init(database *sql.DB, dialect SQLDialect, onError func(error)) error {
 	if err != nil {
 		return err
 	}
-	initialized := newService(backend, onError)
+	initialized := newService(backend)
 	if err := backend.ensureSchema(initialized.ctx); err != nil {
 		initialized.cancel()
 		return err
@@ -65,10 +61,10 @@ func Init(database *sql.DB, dialect SQLDialect, onError func(error)) error {
 	return nil
 }
 
-func newService(backend *sqlBackend, onError func(error)) *service {
+func newService(backend *sqlBackend) *service {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &service{
-		backend: backend, ctx: ctx, cancel: cancel, onError: onError,
+		backend: backend, ctx: ctx, cancel: cancel,
 		statistics: make(map[string]*Statistics), closing: make(chan struct{}),
 	}
 }
@@ -100,7 +96,6 @@ func (initialized *service) runCleanup(initialDelay time.Duration) {
 			}
 			affected, err := initialized.backend.cleanup(initialized.ctx, cutoff)
 			if err != nil {
-				initialized.onError(err)
 				if isClosedDatabase(err) {
 					initialized.stop()
 					return
@@ -108,7 +103,6 @@ func (initialized *service) runCleanup(initialDelay time.Duration) {
 				break
 			}
 			if affected < 0 || affected > cleanupBatchSize {
-				initialized.onError(fmt.Errorf("invalid statistics cleanup row count: %d", affected))
 				break
 			}
 			if affected < cleanupBatchSize {
@@ -117,7 +111,6 @@ func (initialized *service) runCleanup(initialDelay time.Duration) {
 				}
 				err = initialized.backend.cleanupBatches(initialized.ctx, cutoff-int64(batchRetention/time.Second))
 				if err != nil {
-					initialized.onError(err)
 					if isClosedDatabase(err) {
 						initialized.stop()
 						return

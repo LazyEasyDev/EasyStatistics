@@ -48,9 +48,7 @@ func run() error {
 	}
 	defer database.Close()
 
-	if err := EasyStatistics.Init(database, EasyStatistics.SQLSQLite, func(err error) {
-		log.Printf("statistics: %v", err)
-	}); err != nil {
+	if err := EasyStatistics.Init(database, EasyStatistics.SQLSQLite); err != nil {
 		return err
 	}
 	defer EasyStatistics.Close()
@@ -138,6 +136,10 @@ if err := score.Add(map[string]any{"user": "alice", "activity": "mining"}, 10); 
 - Positive, negative, and zero deltas are accepted. Deltas and totals are `int64`; **keep accumulated totals within its range**. Arithmetic is not checked for overflow and can wrap.
 - `Add` performs no SQL work. It can be called concurrently, but callers must not modify an input map while it is being read.
 
+**If `Add` observes a closing or closed service, it returns nil and ignores the addition.** This also applies to old statistics handles after reinitialization; they do not send updates to the new service. The check before modifying the buffer also ignores a call that observes shutdown after preparing its changes.
+
+This is intentional for high-frequency, best-effort statistics: request goroutines may still report counters during shutdown, and returning a closed-service error for every call could flood application logs. Invalid fields and values still return errors while the service is running, so input-format mistakes can be caught during development and testing. **A nil return is not a persistence guarantee:** ignored additions are neither buffered nor uploaded. Stop producers before calling `Close` when their final additions must be accepted.
+
 ### Find A Registered Statistic
 
 ```go
@@ -207,15 +209,13 @@ Expiry is **best-effort cleanup**, not a strict validity deadline. An expired ro
 
 Retention applies to every value and interval in the dimension, including `GroupForever`, and is based on inactivity rather than bucket age. A changed `ClearAfter` policy applies when a row is written again; registration does not rewrite existing deadlines. Keep application-server clocks synchronized across processes, and use consistent policies. Timestamps remain Unix seconds and buckets remain UTC; the database clock is not used.
 
-Each deletion batch and marker pruning have separate **60-second SQL timeout contexts**; this is not a timeout for the whole sweep or a guarantee of immediate server-side statement cancellation. A failed sweep stops, reports the error callback, and retries on the next scheduled sweep; already committed deletions remain committed. Cleanup runs independently of upload workers, although SQL locks and database load can still affect uploads. `Close` wakes a waiting cleaner, waits for an in-flight cleanup operation, and prevents further cleanup batches from starting.
+Each deletion batch and marker pruning have separate **60-second SQL timeout contexts**; this is not a timeout for the whole sweep or a guarantee of immediate server-side statement cancellation. A failed sweep stops and retries on the next scheduled sweep unless the database pool is closed; already committed deletions remain committed. Cleanup runs independently of upload workers, although SQL locks and database load can still affect uploads. `Close` wakes a waiting cleaner, waits for an in-flight cleanup operation, and prevents further cleanup batches from starting.
 
 ### Handle Errors
 
-`Init` requires a non-nil `func(error)` for worker failures and returns an error if the callback is nil. The callback receives batch-creation, upload, and confirmed batch-marker-deletion failures wrapped with the statistic name. Service-wide cleanup failures are reported without a statistic name.
+Initialization, registration, lookup, input validation in `Add`, and query errors return directly to their callers. `Add` silently ignores additions when it observes a closing or closed service, as explained above.
 
-The callback runs synchronously, outside the buffer and service locks. Different workers may call it concurrently. Keep it quick and protect shared application state. **Do not call `Close` synchronously from the callback**, because it waits for that worker to exit.
-
-Initialization, registration, lookup, `Add`, and query errors return directly to their callers. Worker errors are reported only through `onError`; they are not stored or returned by `Close`. The library does not expose shared error sentinels or a latest-error status.
+Background failures are handled internally through upload retries or stopping a failed cleanup sweep. They are not logged, stored, or returned by `Close`. The library does not expose shared error sentinels or a latest-error status. A permanently closed database pool stops new work and causes the affected worker to exit.
 
 ### Shut Down
 
@@ -229,15 +229,15 @@ Call `EasyStatistics.Close()` explicitly during application shutdown. It stops a
 | `Init` while running or draining | Returns an error |
 | `Init` after completed `Close` | Creates a fresh service and statistics registry |
 
-The service owns one internal context for schema setup, uploads, and cleanup. It remains alive throughout draining and is canceled only after workers finish. `Close` stops scheduling cleanup sweeps and waits for an in-flight cleanup operation without starting another batch, while statistics workers drain. Those workers finish pending and active snapshots in order through the same retrying submission logic used during normal operation. Failed mini-batch attempts are reported and retried after **10 seconds**, with a fresh timeout per attempt. Confirmed mini-batches are not replayed.
+The service owns one internal context for schema setup, uploads, and cleanup. It remains alive throughout draining and is canceled only after workers finish. `Close` stops scheduling cleanup sweeps and waits for an in-flight cleanup operation without starting another batch, while statistics workers drain. Those workers finish pending and active snapshots in order through the same retrying submission logic used during normal operation. Failed mini-batch attempts are retried after **10 seconds**, with a fresh timeout per attempt. Confirmed mini-batches are not replayed.
 
-There is **no overall shutdown deadline**. An unavailable server, invalid schema, or another persistent upload failure can make shutdown wait indefinitely. If a worker observes that the `*sql.DB` pool is permanently closed, it reports the failure through `onError`, stops new work, and exits. Unuploaded data stays in memory and is lost when the process exits.
+There is **no overall shutdown deadline**. An unavailable server, invalid schema, or another persistent upload failure can make shutdown wait indefinitely. If a worker observes that the `*sql.DB` pool is permanently closed, it stops new work and exits. Unuploaded data stays in memory and is lost when the process exits.
 
-After initialization, `Close` returns nil once all workers have exited. This does not guarantee that every buffered update was persisted; worker failures are available only through `onError`. Calling `Close` before initialization returns an error. Registrations, lookups, additions, and queries reject a closing or closed service.
+After initialization, `Close` returns nil once all workers have exited. This does not guarantee that every buffered update was persisted; background failures are not returned. Calling `Close` before initialization returns an error. Registrations, lookups, and queries reject a closing or closed service; `Add` instead returns nil and ignores the addition.
 
 Each accepted query owns an independent **60-second SQL timeout context**. `Close` does not wait for caller queries or cancel them. Queries accepted before shutdown may finish after `Close` returns, subject to their own timeout; new queries are rejected once shutdown begins.
 
-The library never closes or reconfigures your database pool. Keep it open, and keep the process alive, until `Close` returns and all caller queries have finished. Reinitialization does not move accepted queries to the new service or its database pool. Shutdown waits for background uploads, cleanup sweeps, retry delays, and callbacks, not application query calls.
+The library never closes or reconfigures your database pool. Keep it open, and keep the process alive, until `Close` returns and all caller queries have finished. Reinitialization does not move accepted queries to the new service or its database pool. Shutdown waits for background uploads, cleanup sweeps, and retry delays, not application query calls.
 
 ## Database Options
 
@@ -269,7 +269,7 @@ SQL dialect support is implemented for the databases above; it is not a claim th
 ## API Reference
 
 ```text
-Init(database *sql.DB, dialect SQLDialect, onError func(error)) error
+Init(database *sql.DB, dialect SQLDialect) error
 NewStatistics(name string, updateInterval time.Duration, fields []string, dimensions []Dimension) (*Statistics, error)
 GetStatistics(name string) (*Statistics, error)
 Close() error
@@ -286,7 +286,7 @@ Only one service can be running or draining at a time. After `Close` completes, 
 
 Dialect helpers in [dialect.go](dialect.go) generate SQL using only `SQLDialect`; they do not depend on the database backend. [sql.go](sql.go) owns SQL execution, transactions, batch identity, timeouts, and upload retries. [statistics.go](statistics.go) owns buffering, the normal update interval, and final draining. [store.go](store.go) owns the service lifecycle and global cleanup worker.
 
-`runCleanup` owns cleanup scheduling, the fixed application-time cutoff for each sweep, the repeat-until-short-batch loop, error callbacks, and shutdown checks. The SQL backend's `cleanup` method attempts exactly one deletion batch and returns its affected-row count and error; it does not schedule, repeat, or inspect the service's closing signal. Old batch-marker pruning is a separate SQL operation called by the worker.
+`runCleanup` owns cleanup scheduling, the fixed application-time cutoff for each sweep, the repeat-until-short-batch loop, failure handling, and shutdown checks. The SQL backend's `cleanup` method attempts exactly one deletion batch and returns its affected-row count and error; it does not schedule, repeat, or inspect the service's closing signal. Old batch-marker pruning is a separate SQL operation called by the worker.
 
 ### Buffering And Retries
 
@@ -331,7 +331,8 @@ Markers older than **30 days** are pruned by the global cleanup worker. Removing
 This library is for **approximate statistics**, not a durable event ledger:
 
 - A crash loses buffered additions because buffers exist only in memory.
-- Shutdown may wait indefinitely for a persistent database failure; a closed pool stops submission and reports its error through `onError`.
+- Shutdown may wait indefinitely for a persistent database failure; a closed pool stops submission without reporting its background error.
+- `Add` ignores additions when it observes shutdown and returns nil; stop producers before shutdown to avoid dropping late additions.
 - Expiry is opportunistic: expired rows remain visible and can be refreshed until a cleanup sweep deletes them.
 - Mini-batches commit independently, so queries can observe a partially uploaded snapshot.
 - An unavailable database can increase memory use as new values accumulate.
