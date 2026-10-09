@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	mathrand "math/rand"
 	"sync"
 	"time"
 )
@@ -86,8 +87,6 @@ func (initialized *service) runCleanup(initialDelay time.Duration) {
 		return
 	case <-timer.C:
 	}
-	ticker := time.NewTicker(cleanupInterval)
-	defer ticker.Stop()
 	for {
 		cutoff := time.Now().UTC().Unix()
 		for {
@@ -95,34 +94,29 @@ func (initialized *service) runCleanup(initialDelay time.Duration) {
 				return
 			}
 			affected, err := initialized.backend.cleanup(initialized.ctx, cutoff)
-			if err != nil {
-				if isClosedDatabase(err) {
-					initialized.stop()
-					return
+			if err == nil && affected >= 0 && affected <= cleanupBatchSize {
+				if affected == cleanupBatchSize {
+					continue
 				}
-				break
-			}
-			if affected < 0 || affected > cleanupBatchSize {
-				break
-			}
-			if affected < cleanupBatchSize {
 				if initialized.isClosing() {
 					return
 				}
-				err = initialized.backend.cleanupBatches(initialized.ctx, cutoff-int64(batchRetention/time.Second))
-				if err != nil {
-					if isClosedDatabase(err) {
-						initialized.stop()
-						return
-					}
+				if err := initialized.backend.cleanupBatches(initialized.ctx, cutoff-int64(batchRetention/time.Second)); err == nil {
+					break
 				}
-				break
+			}
+			timer.Reset(time.Duration(60+mathrand.Intn(241)) * time.Second)
+			select {
+			case <-initialized.closing:
+				return
+			case <-timer.C:
 			}
 		}
+		timer.Reset(cleanupInterval)
 		select {
 		case <-initialized.closing:
 			return
-		case <-ticker.C:
+		case <-timer.C:
 		}
 	}
 }

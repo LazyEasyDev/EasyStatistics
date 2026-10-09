@@ -204,24 +204,11 @@ func (backend *sqlBackend) submit(parent context.Context, batch *uploadBatch) er
 		if err == nil {
 			continue
 		}
-		if isClosedDatabase(err) {
-			return err
-		}
 		retryDelay := time.Duration(2+mathrand.Intn(9)) * time.Second
 		if err := waitDelay(parent, retryDelay); err != nil {
 			return err
 		}
 	}
-}
-
-func isClosedDatabase(err error) bool {
-	for err != nil {
-		if err.Error() == "sql: database is closed" {
-			return true
-		}
-		err = errors.Unwrap(err)
-	}
-	return false
 }
 
 func (backend *sqlBackend) submitOnce(ctx context.Context, batch *uploadBatch) error {

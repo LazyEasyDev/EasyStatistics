@@ -201,7 +201,7 @@ Set `Dimension.ClearAfter` to make persisted records eligible for deletion after
 
 Every insert or update stores `expire_time = last_update_time + ClearAfter` in SQL, using Unix seconds and the retained latest addition timestamp. With `ClearAfter == 0`, it stores `expire_time = 0`, which means never expire. Delayed uploads do not move `last_update_time` backwards or extend expiry merely because they were uploaded later.
 
-One service-wide cleanup worker runs per process, even with no registered statistics. **There is no immediate startup cleanup.** Each successful initialization chooses an independent random first delay between **1 second and 24 hours**, then repeats every **24 hours** from that first trigger, not at midnight. This staggers processes sharing the same tables but does not guarantee that cleaners never overlap. No cleanup runs while all service processes are stopped; restarting a process chooses a new delay, so frequent restarts can postpone cleanup.
+One service-wide cleanup worker runs per process, even with no registered statistics. **There is no immediate startup cleanup.** Each successful initialization chooses an independent random first delay between **1 second and 24 hours**. After a sweep completes successfully, the worker waits **24 hours** before the next sweep, not until midnight. This staggers processes sharing the same tables but does not guarantee that cleaners never overlap. No cleanup runs while all service processes are stopped; restarting a process chooses a new delay, so frequent restarts can postpone cleanup.
 
 Each sweep captures the application-server time once, using the same clock as `Add`, then deletes rows where `expire_time > 0` and `expire_time <= that cutoff` in batches of at most **500 rows**. Every batch commits independently. The worker continues until a successful batch deletes fewer than 500 rows; an exact multiple requires one final empty batch. There is no whole-sweep row or runtime limit. Rows becoming expired after the cutoff wait for a later sweep, and deletion rechecks expiry so refreshed rows are not removed merely because they were previously eligible. Batch-marker creation also uses application-server time; markers older than 30 days at the same sweep cutoff are pruned after record cleanup. Persisted expiry does not depend on re-registering the original dimension.
 
@@ -209,13 +209,13 @@ Expiry is **best-effort cleanup**, not a strict validity deadline. An expired ro
 
 Retention applies to every value and interval in the dimension, including `GroupForever`, and is based on inactivity rather than bucket age. A changed `ClearAfter` policy applies when a row is written again; registration does not rewrite existing deadlines. Keep application-server clocks synchronized across processes, and use consistent policies. Timestamps remain Unix seconds and buckets remain UTC; the database clock is not used.
 
-Each deletion batch and marker pruning have separate **60-second SQL timeout contexts**; this is not a timeout for the whole sweep or a guarantee of immediate server-side statement cancellation. A failed sweep stops and retries on the next scheduled sweep unless the database pool is closed; already committed deletions remain committed. Cleanup runs independently of upload workers, although SQL locks and database load can still affect uploads. `Close` wakes a waiting cleaner, waits for an in-flight cleanup operation, and prevents further cleanup batches from starting.
+Each deletion batch and marker pruning have separate **60-second SQL timeout contexts**; this is not a timeout for the whole sweep or a guarantee of immediate server-side statement cancellation. If either operation fails, the worker waits a fresh random whole-second delay from **60 through 300 seconds**, inclusive, then retries with the same sweep cutoff. Consecutive failures follow the same rule without a retry limit; already committed deletions remain committed. Only successful record cleanup and marker pruning start the next 24-hour wait. Cleanup runs independently of upload workers, although SQL locks and database load can still affect uploads. `Close` promptly interrupts initial, daily, and retry waits, waits for an in-flight cleanup operation, and prevents further cleanup batches from starting.
 
 ### Handle Errors
 
 Initialization, registration, lookup, input validation in `Add`, and query errors return directly to their callers. `Add` silently ignores additions when it observes a closing or closed service, as explained above.
 
-Background failures are handled internally through upload retries or stopping a failed cleanup sweep. They are not logged, stored, or returned by `Close`. The library does not expose shared error sentinels or a latest-error status. A permanently closed database pool stops new work and causes the affected worker to exit.
+Background failures are handled internally through upload and cleanup retries. They are not logged, stored, or returned by `Close`. The library does not expose shared error sentinels or a latest-error status. Closed-pool errors are treated like other database errors and do not automatically stop the service.
 
 ### Shut Down
 
@@ -231,13 +231,13 @@ Call `EasyStatistics.Close()` explicitly during application shutdown. It stops a
 
 The service owns one internal context for schema setup, uploads, and cleanup. It remains alive throughout draining and is canceled only after workers finish. `Close` stops scheduling cleanup sweeps and waits for an in-flight cleanup operation without starting another batch, while statistics workers drain. Those workers finish pending and active snapshots in order through the same retrying submission logic used during normal operation. Failed mini-batch attempts are retried after a freshly randomized delay of **2 to 10 seconds**, with a fresh timeout per attempt. Confirmed mini-batches are not replayed.
 
-There is **no overall shutdown deadline**. An unavailable server, invalid schema, or another persistent upload failure can make shutdown wait indefinitely. If a worker observes that the `*sql.DB` pool is permanently closed, it stops new work and exits. Unuploaded data stays in memory and is lost when the process exits.
+There is **no overall shutdown deadline**. An unavailable server, invalid schema, or another persistent upload failure can make shutdown wait indefinitely. Closing the `*sql.DB` pool early violates the ownership contract: pending uploads keep retrying, so `Close` can wait indefinitely. Unuploaded data stays in memory and is lost when the process exits.
 
 After initialization, `Close` returns nil once all workers have exited. This does not guarantee that every buffered update was persisted; background failures are not returned. Calling `Close` before initialization returns an error. Registrations, lookups, and queries reject a closing or closed service; `Add` instead returns nil and ignores the addition.
 
 Each accepted query owns an independent **60-second SQL timeout context**. `Close` does not wait for caller queries or cancel them. Queries accepted before shutdown may finish after `Close` returns, subject to their own timeout; new queries are rejected once shutdown begins.
 
-The library never closes or reconfigures your database pool. Keep it open, and keep the process alive, until `Close` returns and all caller queries have finished. Reinitialization does not move accepted queries to the new service or its database pool. Shutdown waits for background uploads, cleanup sweeps, and retry delays, not application query calls.
+The library never closes or reconfigures your database pool. Stop and join producers, wait for `EasyStatistics.Close()` to return and all accepted caller queries to finish, then call `db.Close()`. Keep the process alive throughout draining. Reinitialization does not move accepted queries to the new service or its database pool. Shutdown waits for background uploads and in-flight cleanup operations; cleanup scheduling and retry waits stop promptly, but upload retries continue during draining. Shutdown does not wait for application query calls.
 
 ## Database Options
 
@@ -312,9 +312,9 @@ Every dialect uses the same upload flow: register the batch marker, execute one 
 
 Record IDs are sorted within each mini-batch to give writers a consistent lock order. Concurrent servers can still wait on overlapping rows, and transaction locks remain held until commit or rollback, not just until each row statement finishes. Upserts avoid the previous missing-row locking read but do not guarantee freedom from deadlocks or lock timeouts; those failures use the same safe batch retry path.
 
-Failed attempts retry inside the SQL backend after a random whole-second delay from **2 through 10 seconds**, inclusive, until successful or a closed-pool error is detected. Each failure chooses a new delay to spread retries from concurrent workers and processes; this does not guarantee that retries never overlap. This retry jitter is independent of randomized cleanup scheduling. `Close` leaves in-flight submissions and retry waits running with the same internal context, then drains newer active rows. Successful snapshot submissions restart the statistic's normal update interval. An unreachable database server is not treated as a permanently closed pool.
+Failed attempts retry inside the SQL backend after a random whole-second delay from **2 through 10 seconds**, inclusive, until successful or the internal context is canceled. Each failure chooses a new delay to spread retries from concurrent workers and processes; this does not guarantee that retries never overlap. This retry jitter is independent of randomized cleanup scheduling. `Close` leaves in-flight submissions and retry waits running with the same internal context, then drains newer active rows. Successful snapshot submissions restart the statistic's normal update interval. Closed pools and unreachable database servers use the same retry path.
 
-The SQL backend gives schema setup, each cleanup sweep, and each mini-batch attempt a **60-second child context** of the internal service context. Queries use their own independent 60-second contexts. Cleanup is independent of uploads and cannot consume a mini-batch's write timeout. Each following mini-batch and every retry receives a fresh budget; there is no overall snapshot deadline. Timeouts require driver cancellation support to be effective.
+The SQL backend gives schema setup, each cleanup operation, and each mini-batch attempt a **60-second child context** of the internal service context. Queries use their own independent 60-second contexts. Cleanup is independent of uploads and cannot consume a mini-batch's write timeout. Each following mini-batch and every retry receives a fresh budget; there is no overall snapshot deadline. Timeouts require driver cancellation support to be effective.
 
 Uploads perform no retention cleanup. The single service-wide cleanup worker uses `cleanupInterval` in [store.go](store.go), set to 24 hours. It deletes expired records directly with a SQL predicate instead of selecting IDs for later deletion. Multiple service processes may run sweeps against the same database; deletion always checks the currently stored deadline.
 
@@ -331,7 +331,7 @@ Markers older than **30 days** are pruned by the global cleanup worker. Removing
 This library is for **approximate statistics**, not a durable event ledger:
 
 - A crash loses buffered additions because buffers exist only in memory.
-- Shutdown may wait indefinitely for a persistent database failure; a closed pool stops submission without reporting its background error.
+- Shutdown may wait indefinitely for a persistent database failure, including a pool closed before pending uploads finish.
 - `Add` ignores additions when it observes shutdown and returns nil; stop producers before shutdown to avoid dropping late additions.
 - Expiry is opportunistic: expired rows remain visible and can be refreshed until a cleanup sweep deletes them.
 - Mini-batches commit independently, so queries can observe a partially uploaded snapshot.
