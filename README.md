@@ -202,7 +202,7 @@ Expiry is **best-effort cleanup**, not a strict validity deadline. An expired ro
 
 Retention applies to every value and interval in the dimension, including `GroupForever`, and is based on inactivity rather than bucket age. A changed `ClearAfter` policy applies when a row is written again; registration does not rewrite existing deadlines. Keep application and database clocks synchronized, and use consistent policies across processes.
 
-Each cleanup sweep has a **30-second SQL timeout**. Failures are reported through the error callback and tried again on the next scheduled sweep, without blocking uploads. `Close` stops scheduling sweeps and waits for any ongoing sweep to finish.
+Each cleanup sweep has a **60-second SQL timeout**. Failures are reported through the error callback and tried again on the next scheduled sweep, without blocking uploads. `Close` stops scheduling sweeps and waits for any ongoing sweep to finish.
 
 ### Handle Errors
 
@@ -219,8 +219,10 @@ Call `EasyStatistics.Close()` explicitly during application shutdown. It stops a
 | Operation | Behavior |
 | --- | --- |
 | `Close` | Stops admission and waits for workers to finish; returns nil after initialization |
-| Concurrent `Close` | All callers wait for the same workers to finish |
-| Repeated `Close` | Returns nil; does not restart uploads |
+| Concurrent `Close` | Calls for the same service wait for its workers to finish |
+| Repeated `Close` | Returns nil while the current service remains closed; does not restart uploads |
+| `Init` while running or draining | Returns an error |
+| `Init` after completed `Close` | Creates a fresh service and statistics registry |
 
 The service owns one internal context for schema setup, uploads, and cleanup. It remains alive throughout draining and is canceled only after workers finish. `Close` stops scheduling cleanup sweeps and waits for any ongoing sweep while statistics workers drain. Those workers finish pending and active snapshots in order through the same retrying submission logic used during normal operation. Failed mini-batch attempts are reported and retried after **10 seconds**, with a fresh timeout per attempt. Confirmed mini-batches are not replayed.
 
@@ -228,9 +230,9 @@ There is **no overall shutdown deadline**. An unavailable server, invalid schema
 
 After initialization, `Close` returns nil once all workers have exited. This does not guarantee that every buffered update was persisted; worker failures are available only through `onError`. Calling `Close` before initialization returns an error. Registrations, lookups, additions, and queries reject a closing or closed service.
 
-Each accepted query owns an independent **30-second SQL timeout context**. `Close` does not wait for caller queries or cancel them. Queries accepted before shutdown may finish after `Close` returns, subject to their own timeout; new queries are rejected once shutdown begins.
+Each accepted query owns an independent **60-second SQL timeout context**. `Close` does not wait for caller queries or cancel them. Queries accepted before shutdown may finish after `Close` returns, subject to their own timeout; new queries are rejected once shutdown begins.
 
-The library never closes or reconfigures your database pool. Keep it open, and keep the process alive, until `Close` returns and all caller queries have finished. Shutdown waits for background uploads, cleanup sweeps, retry delays, and callbacks, not application query calls.
+The library never closes or reconfigures your database pool. Keep it open, and keep the process alive, until `Close` returns and all caller queries have finished. Reinitialization does not move accepted queries to the new service or its database pool. Shutdown waits for background uploads, cleanup sweeps, retry delays, and callbacks, not application query calls.
 
 ## Database Options
 
@@ -253,7 +255,9 @@ The counter table requires the `expire_time` column. Existing tables created wit
 
 The Oracle insert explicitly stores an empty dimension value as a non-null empty CLOB rather than SQL NULL.
 
-SQL dialect support is implemented for the databases above; it is not a claim that every driver or server version has been live-tested. SQLite was exercised during development. Validate your chosen driver and deployment before production use.
+Native upsert or `MERGE` support is required. `SQLGaussDB` uses the openGauss-compatible `ON DUPLICATE KEY UPDATE` syntax with `EXCLUDED` references. Keep `record_id` as the counter table's only unique key: additional unique constraints can make MySQL-family or GaussDB upserts match a different logical record.
+
+SQL dialect support is implemented for the databases above; it is not a claim that every driver or server version has been live-tested. SQLite and local MySQL 8.4.11 with `go-sql-driver/mysql` 1.10.1 were exercised during development. MySQL checks used isolated tables and covered transactions, retries, expiry cleanup, and the public API. Validate your chosen driver and deployment before production use.
 
 ## API Reference
 
@@ -269,7 +273,7 @@ Close() error
 (*Statistics).GetWithUnixTimeSecond(orderFields []OrderField, interval GroupInterval, timestamp int64) (*Record, error)
 ```
 
-There is one successful initialization per process, even after shutdown. A failed initialization may be retried. Re-register definitions after a process restart. Statistic names must be unique in the process; names and field names must contain 1 to 255 UTF-8 bytes, with no surrounding whitespace or control characters. Configuration slices are copied at registration.
+Only one service can be running or draining at a time. After `Close` completes, `Init` may create a fresh service using the same or a different database pool. A failed initialization may be retried. Old statistics handles remain closed; re-register definitions after reinitialization or a process restart. Persisted counters remain in their original database. Statistic names must be unique within the current service; names and field names must contain 1 to 255 UTF-8 bytes, with no surrounding whitespace or control characters. Configuration slices are copied at registration.
 
 ## Design Notes
 
@@ -295,9 +299,13 @@ Deferring record IDs avoids repeated JSON encoding and hashing when many additio
 
 The SQL backend splits a pending snapshot into mini-batches of at most **500 rows**, controlled by the positive `miniBatchSize` constant in [sql.go](sql.go). Mini-batches are submitted sequentially, with one transaction per mini-batch. Confirmed rows are removed from the pending snapshot before proceeding; the current mini-batch is retained unchanged across failures. Newer snapshots do not overtake pending rows. Atomicity is per mini-batch, not per complete snapshot.
 
+Every dialect uses the same upload flow: register the batch marker, execute one native SQL upsert per record, then commit. SQL adds the incoming counter delta, retains the latest timestamp, and recalculates expiry; existing key metadata is not overwritten. Uploads trust the generated record ID and library table schema without reading each record back. Queries still validate stored key metadata. These are sequential single-row upserts, not one bulk statement.
+
+Record IDs are sorted within each mini-batch to give writers a consistent lock order. Concurrent servers can still wait on overlapping rows, and transaction locks remain held until commit or rollback, not just until each row statement finishes. Upserts avoid the previous missing-row locking read but do not guarantee freedom from deadlocks or lock timeouts; those failures use the same safe batch retry path.
+
 Failed attempts retry inside the SQL backend after **10 seconds** until successful or a closed-pool error is detected. `Close` leaves in-flight submissions and retry waits running with the same internal context, then drains newer active rows. Successful snapshot submissions restart the statistic's normal update interval. An unreachable database server is not treated as a permanently closed pool.
 
-The SQL backend gives schema setup, reads, each cleanup sweep, and each mini-batch attempt a **30-second child context** of the internal service context. Cleanup is independent of uploads and cannot consume a mini-batch's write timeout. Each following mini-batch and every retry receives a fresh budget; there is no overall snapshot deadline. Timeouts require driver cancellation support to be effective. Writes remain sequential `SELECT` plus `INSERT` or `UPDATE` statements within each transaction, not bulk SQL.
+The SQL backend gives schema setup, each cleanup sweep, and each mini-batch attempt a **60-second child context** of the internal service context. Queries use their own independent 60-second contexts. Cleanup is independent of uploads and cannot consume a mini-batch's write timeout. Each following mini-batch and every retry receives a fresh budget; there is no overall snapshot deadline. Timeouts require driver cancellation support to be effective.
 
 Uploads perform no retention cleanup. The single service-wide cleanup worker uses `cleanupInterval` in [store.go](store.go), which defaults to one minute. It deletes expired records directly with a SQL predicate instead of selecting IDs for later deletion. Multiple service processes may run sweeps against the same database; deletion always checks the currently stored deadline.
 

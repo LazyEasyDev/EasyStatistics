@@ -168,16 +168,8 @@ func (dialect SQLDialect) insert(table string, names ...string) string {
 	return "INSERT INTO " + dialect.quote(table) + " (" + dialect.columns(names...) + ") VALUES (" + strings.Join(parameters, ", ") + ")"
 }
 
-func (dialect SQLDialect) selectRecord(locked bool) string {
-	query := "SELECT " + dialect.columns("name", "dimension_id", "dimension_fields", "dimension_value", "group_interval", "grouped_time", "last_update_time", "counter") + " FROM " + dialect.quote(tableName)
-	if locked && dialect == SQLServer {
-		query += " WITH (UPDLOCK, HOLDLOCK)"
-	}
-	query += " WHERE " + dialect.quote("record_id") + " = " + dialect.bind(1)
-	if locked && dialect != SQLSQLite && dialect != SQLServer {
-		query += " FOR UPDATE"
-	}
-	return query
+func (dialect SQLDialect) selectRecord() string {
+	return "SELECT " + dialect.columns("name", "dimension_id", "dimension_fields", "dimension_value", "group_interval", "grouped_time", "last_update_time", "counter") + " FROM " + dialect.quote(tableName) + " WHERE " + dialect.quote("record_id") + " = " + dialect.bind(1)
 }
 
 func (dialect SQLDialect) selectBatch() string {
@@ -223,8 +215,73 @@ func (dialect SQLDialect) insertRecord() string {
 	return dialect.insert(tableName, names...)
 }
 
-func (dialect SQLDialect) updateRecord() string {
-	return "UPDATE " + dialect.quote(tableName) + " SET " + dialect.quote("counter") + " = " + dialect.bind(1) + ", " + dialect.quote("last_update_time") + " = " + dialect.bind(2) + ", " + dialect.quote("expire_time") + " = " + dialect.bind(3) + " WHERE " + dialect.quote("record_id") + " = " + dialect.bind(4)
+func (dialect SQLDialect) upsertRecord() (string, error) {
+	counter := dialect.quote("counter")
+	updated := dialect.quote("last_update_time")
+	switch dialect {
+	case SQLMySQL, SQLMariaDB, SQLTiDB:
+		updates := dialect.upsertAssignments(counter, "VALUES("+counter+")", updated, "VALUES("+updated+")", dialect.bind(11))
+		return dialect.insertRecord() + " ON DUPLICATE KEY UPDATE " + updates, nil
+	case SQLGaussDB:
+		updates := dialect.upsertAssignments(counter, "EXCLUDED."+counter, updated, "EXCLUDED."+updated, dialect.bind(11))
+		return dialect.insertRecord() + " ON DUPLICATE KEY UPDATE " + updates, nil
+	case SQLPostgreSQL, SQLSQLite:
+		table := dialect.quote(tableName) + "."
+		updates := dialect.upsertAssignments(table+counter, "excluded."+counter, table+updated, "excluded."+updated, dialect.bind(11))
+		return dialect.insertRecord() + " ON CONFLICT (" + dialect.quote("record_id") + ") DO UPDATE SET " + updates, nil
+	case SQLServer, SQLOracle:
+		names := []string{"record_id", "name", "dimension_id", "dimension_fields", "dimension_value", "group_interval", "grouped_time", "last_update_time", "expire_time", "counter"}
+		sources := make([]string, len(names)+1)
+		values := make([]string, len(names))
+		for index, name := range names {
+			parameter := dialect.bind(index + 1)
+			if dialect == SQLOracle && name == "dimension_value" {
+				parameter = "NVL(TO_CLOB(" + parameter + "), EMPTY_CLOB())"
+			}
+			sources[index] = parameter + " AS " + dialect.quote(name)
+			values[index] = "incoming." + dialect.quote(name)
+		}
+		sources[len(names)] = dialect.bind(11) + " AS " + dialect.quote("clear_after")
+		source := "SELECT " + strings.Join(sources, ", ")
+		table := dialect.quote(tableName)
+		if dialect == SQLOracle {
+			source += " FROM DUAL"
+		} else {
+			table += " WITH (HOLDLOCK)"
+		}
+		identity := dialect.quote("record_id")
+		updates := dialect.upsertAssignments("target."+counter, "incoming."+counter, "target."+updated, "incoming."+updated, "incoming."+dialect.quote("clear_after"))
+		query := "MERGE INTO " + table + " target USING (" + source + ") incoming ON (target." + identity + " = incoming." + identity + ")" +
+			" WHEN MATCHED THEN UPDATE SET " + updates +
+			" WHEN NOT MATCHED THEN INSERT (" + dialect.columns(names...) + ") VALUES (" + strings.Join(values, ", ") + ")"
+		if dialect == SQLServer {
+			query += ";"
+		}
+		return query, nil
+	default:
+		return "", fmt.Errorf("unsupported SQL dialect %q", dialect)
+	}
+}
+
+func (dialect SQLDialect) upsertAssignments(counter, delta, updated, added, clearAfter string) string {
+	if dialect == SQLPostgreSQL || dialect == SQLGaussDB {
+		clearAfter = "CAST(" + clearAfter + " AS BIGINT)"
+	}
+	latest := "CASE WHEN " + updated + " > " + added + " THEN " + updated + " ELSE " + added + " END"
+	return dialect.quote("counter") + " = " + counterAddition(counter, delta) + ", " +
+		dialect.quote("last_update_time") + " = " + latest + ", " +
+		dialect.quote("expire_time") + " = COALESCE((" + latest + ") + NULLIF(" + clearAfter + ", 0), 0)"
+}
+
+func counterAddition(counter, delta string) string {
+	const maximum = "9223372036854775807"
+	const minimum = "-9223372036854775808"
+	sum := counter + " + " + delta
+	return "CASE WHEN " + delta + " > 0 THEN CASE WHEN " + counter + " > " + maximum + " - " + delta +
+		" THEN (" + counter + " - " + maximum + ") + (" + delta + " - " + maximum + ") - 2 ELSE " + sum + " END " +
+		"WHEN " + delta + " < 0 THEN CASE WHEN " + counter + " < " + minimum + " - " + delta +
+		" THEN (" + counter + " + " + maximum + " + 1) + (" + delta + " + " + maximum + " + 1) ELSE " + sum + " END " +
+		"ELSE " + counter + " END"
 }
 
 func (dialect SQLDialect) schemaQuery(index int) string {

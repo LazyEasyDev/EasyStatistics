@@ -14,7 +14,7 @@ import (
 const (
 	miniBatchSize  = 500
 	retryDelay     = 10 * time.Second
-	sqlTimeout     = 30 * time.Second
+	sqlTimeout     = 60 * time.Second
 	batchRetention = 30 * 24 * time.Hour
 )
 
@@ -46,10 +46,6 @@ type sqlBackend struct {
 	db      *sql.DB
 	dialect SQLDialect
 	schema  []string
-}
-
-type rowQueryer interface {
-	QueryRowContext(context.Context, string, ...any) *sql.Row
 }
 
 func newSQLBackend(database *sql.DB, dialect SQLDialect) (*sqlBackend, error) {
@@ -119,12 +115,8 @@ func waitDelay(ctx context.Context, delay time.Duration) error {
 func (backend *sqlBackend) getRow(identity string) (counterRow, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), sqlTimeout)
 	defer cancel()
-	return backend.readRow(ctx, backend.db, identity, false)
-}
-
-func (backend *sqlBackend) readRow(ctx context.Context, queryer rowQueryer, identity string, locked bool) (counterRow, error) {
 	row := counterRow{id: identity}
-	err := queryer.QueryRowContext(ctx, backend.dialect.selectRecord(locked), identity).Scan(
+	err := backend.db.QueryRowContext(ctx, backend.dialect.selectRecord(), identity).Scan(
 		&row.name, &row.dimensionID, &row.dimension, &row.value, &row.interval, &row.bucket, &row.updated, &row.counter,
 	)
 	return row, err
@@ -142,6 +134,10 @@ func expireTime(updated int64, clearAfter time.Duration) int64 {
 }
 
 func (backend *sqlBackend) applyBatch(ctx context.Context, batch *miniBatch) error {
+	statement, err := backend.dialect.upsertRecord()
+	if err != nil {
+		return err
+	}
 	transaction, err := backend.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin statistics batch: %w", err)
@@ -159,23 +155,10 @@ func (backend *sqlBackend) applyBatch(ctx context.Context, batch *miniBatch) err
 		return fmt.Errorf("register statistics batch: %w", err)
 	}
 	for _, incoming := range batch.rows {
-		existing, err := backend.readRow(ctx, transaction, incoming.id, true)
-		if errors.Is(err, sql.ErrNoRows) {
-			_, err = transaction.ExecContext(ctx, backend.dialect.insertRecord(), incoming.id, incoming.name, incoming.dimensionID, incoming.dimension, incoming.value,
-				string(incoming.interval), incoming.bucket, incoming.updated, expireTime(incoming.updated, incoming.clearAfter), incoming.counter)
-		} else if err == nil {
-			if existing.name != incoming.name || existing.dimensionID != incoming.dimensionID || existing.dimension != incoming.dimension || existing.value != incoming.value || existing.interval != incoming.interval || existing.bucket != incoming.bucket {
-				return errors.New("stored record identity does not match its key")
-			}
-			counter := existing.counter + incoming.counter
-			updated := incoming.updated
-			if existing.updated > updated {
-				updated = existing.updated
-			}
-			_, err = transaction.ExecContext(ctx, backend.dialect.updateRecord(), counter, updated, expireTime(updated, incoming.clearAfter), incoming.id)
-		}
+		_, err := transaction.ExecContext(ctx, statement, incoming.id, incoming.name, incoming.dimensionID, incoming.dimension, incoming.value,
+			string(incoming.interval), incoming.bucket, incoming.updated, expireTime(incoming.updated, incoming.clearAfter), incoming.counter, expireTime(0, incoming.clearAfter))
 		if err != nil {
-			return fmt.Errorf("write statistics record: %w", err)
+			return fmt.Errorf("upsert statistics record: %w", err)
 		}
 	}
 	if err := transaction.Commit(); err != nil {
