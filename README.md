@@ -370,9 +370,9 @@ Uploads perform no retention cleanup. The single service-wide cleanup worker use
 
 `easy_statistics` stores counters, their identities, and `expire_time`. Ordered field names and normalized values occupy separate, URL-escaped text columns. SHA-256 keys identify dimensions and records without relying on database text collations. SQL timestamps use Unix seconds; delayed uploads never lower a record's last-update timestamp. Expiry is recalculated from that retained timestamp and the incoming row's `ClearAfter` policy, with zero reserved for non-expiring rows.
 
-`easy_statistics_batches` stores a random 256-bit batch ID and a database-generated creation timestamp. The SQL backend creates a distinct ID for each mini-batch before its first database attempt and retains it across retries. That mini-batch's counter changes and marker commit in one transaction. Retrying an uncertain commit checks the same ID, so a retained marker prevents reapplying its counters. After confirmation, the marker is deleted; a failed deletion does not reapply confirmed changes or advance to the next mini-batch.
+`easy_statistics_batches` stores a random 256-bit batch ID and an application-generated creation timestamp in Unix seconds. The SQL backend creates a distinct ID for each mini-batch before its first database attempt and retains it across retries. That mini-batch's counter changes and marker commit in one transaction. Retrying an uncertain commit checks the same ID, so a retained marker prevents reapplying its counters. After confirmation, the marker is deleted; a failed deletion does not reapply confirmed changes or advance to the next mini-batch.
 
-Markers older than **30 days** are pruned by the global cleanup worker. Removing a confirmed mini-batch's marker remains part of its submission, so confirmation can advance to the next mini-batch. For large counter tables, an optional index on `expire_time` can speed up expiry; the library does not add it automatically.
+Markers older than **30 days** are pruned by the global cleanup worker. Removing a confirmed mini-batch's marker remains part of its submission, so confirmation can advance to the next mini-batch. For large counter tables, an index on `expire_time` can speed up expiry; `Init` reuses a suitable existing index or creates one automatically.
 
 ### Reliability Limits
 
