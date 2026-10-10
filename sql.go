@@ -18,6 +18,9 @@ const (
 	cleanupBatchSize = 500
 	sqlTimeout       = 60 * time.Second
 	batchRetention   = 30 * 24 * time.Hour
+	// Dimension encodings are ASCII. Keep scalar Oracle binds below VARCHAR2
+	// limits even when the supplied driver expands each character to two bytes.
+	oracleTextChunkSize = 1000
 )
 
 type counterRow struct {
@@ -152,9 +155,23 @@ func (backend *sqlBackend) getRow(identity string) (counterRow, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), sqlTimeout)
 	defer cancel()
 	row := counterRow{id: identity}
-	err := backend.db.QueryRowContext(ctx, backend.dialect.selectRecord(), identity).Scan(
-		&row.name, &row.dimensionID, &row.dimension, &row.value, &row.interval, &row.bucket, &row.updated, &row.counter,
-	)
+	var value sql.NullString
+	var valueIsNull int
+	targets := []any{
+		&row.name, &row.dimensionID, &row.dimension, &value, &row.interval, &row.bucket, &row.updated, &row.counter,
+	}
+	if backend.dialect == SQLOracle {
+		targets = append(targets, &valueIsNull)
+	}
+	err := backend.db.QueryRowContext(ctx, backend.dialect.selectRecord(), identity).Scan(targets...)
+	if err == nil {
+		// Some Oracle drivers return a nil value for a non-null EMPTY_CLOB().
+		// Empty dimension values are valid; other dialects must not accept NULL.
+		if valueIsNull != 0 || (!value.Valid && backend.dialect != SQLOracle) {
+			return row, errors.New("stored dimension value is NULL")
+		}
+		row.value = value.String
+	}
 	return row, err
 }
 
@@ -190,15 +207,79 @@ func (backend *sqlBackend) applyBatch(ctx context.Context, batch *miniBatch) err
 	if _, err := transaction.ExecContext(ctx, backend.dialect.insertBatch(), batch.id, time.Now().UTC().Unix()); err != nil {
 		return fmt.Errorf("register statistics batch: %w", err)
 	}
+	var marker string
+	if backend.dialect == SQLOracle {
+		marker = "!" + batch.id
+	}
 	for _, incoming := range batch.rows {
-		_, err := transaction.ExecContext(ctx, statement, incoming.id, incoming.name, incoming.dimensionID, incoming.dimension, incoming.value,
+		dimension, value := incoming.dimension, incoming.value
+		if backend.dialect == SQLOracle {
+			if len(dimension) > oracleTextChunkSize {
+				dimension = marker
+			}
+			if len(value) > oracleTextChunkSize {
+				value = marker
+			}
+		}
+		_, err := transaction.ExecContext(ctx, statement, incoming.id, incoming.name, incoming.dimensionID, dimension, value,
 			string(incoming.interval), incoming.bucket, incoming.updated, expireTime(incoming.updated, incoming.clearAfter), incoming.counter, expireTime(0, incoming.clearAfter))
 		if err != nil {
 			return fmt.Errorf("upsert statistics record: %w", err)
 		}
+		if backend.dialect == SQLOracle {
+			if err := backend.completeOracleClobs(ctx, transaction, incoming, marker); err != nil {
+				return err
+			}
+		}
 	}
 	if err := transaction.Commit(); err != nil {
 		return fmt.Errorf("commit statistics batch: %w", err)
+	}
+	return nil
+}
+
+func (backend *sqlBackend) completeOracleClobs(ctx context.Context, transaction *sql.Tx, row counterRow, marker string) error {
+	for _, field := range []struct{ name, text string }{
+		{"dimension_fields", row.dimension}, {"dimension_value", row.value},
+	} {
+		if len(field.text) <= oracleTextChunkSize {
+			continue
+		}
+		// The random mini-batch marker begins with '!', which cannot occur in
+		// URL-escaped dimension metadata. Only this transaction's newly inserted
+		// row gets the marker; matched metadata stays untouched, even if corrupt.
+		result, err := transaction.ExecContext(ctx, backend.dialect.startOracleClob(field.name), field.text[:oracleTextChunkSize], row.id, marker)
+		if err != nil {
+			return fmt.Errorf("start statistics %s CLOB: %w", field.name, err)
+		}
+		affected, err := result.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("count statistics %s CLOB start: %w", field.name, err)
+		}
+		if affected == 0 {
+			continue
+		}
+		if affected != 1 {
+			return fmt.Errorf("start statistics %s CLOB affected %d rows, expected one", field.name, affected)
+		}
+		statement := backend.dialect.appendOracleClob(field.name)
+		for offset := oracleTextChunkSize; offset < len(field.text); offset += oracleTextChunkSize {
+			end := offset + oracleTextChunkSize
+			if end > len(field.text) {
+				end = len(field.text)
+			}
+			result, err := transaction.ExecContext(ctx, statement, field.text[offset:end], row.id, int64(offset))
+			if err != nil {
+				return fmt.Errorf("complete statistics %s CLOB: %w", field.name, err)
+			}
+			affected, err := result.RowsAffected()
+			if err != nil {
+				return fmt.Errorf("count statistics %s CLOB update: %w", field.name, err)
+			}
+			if affected != 1 {
+				return fmt.Errorf("complete statistics %s CLOB affected %d rows, expected one", field.name, affected)
+			}
+		}
 	}
 	return nil
 }

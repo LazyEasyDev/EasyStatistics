@@ -170,7 +170,13 @@ func (dialect SQLDialect) insert(table string, names ...string) string {
 }
 
 func (dialect SQLDialect) selectRecord() string {
-	return "SELECT " + dialect.columns("name", "dimension_id", "dimension_fields", "dimension_value", "group_interval", "grouped_time", "last_update_time", "counter") + " FROM " + dialect.quote(tableName) + " WHERE " + dialect.quote("record_id") + " = " + dialect.bind(1)
+	columns := dialect.columns("name", "dimension_id", "dimension_fields", "dimension_value", "group_interval", "grouped_time", "last_update_time", "counter")
+	if dialect == SQLOracle {
+		// A driver may represent both SQL NULL and EMPTY_CLOB() as nil. Keep
+		// the actual SQL nullness available so corrupt nullable schemas fail.
+		columns += ", CASE WHEN " + dialect.quote("dimension_value") + " IS NULL THEN 1 ELSE 0 END"
+	}
+	return "SELECT " + columns + " FROM " + dialect.quote(tableName) + " WHERE " + dialect.quote("record_id") + " = " + dialect.bind(1)
 }
 
 func (dialect SQLDialect) selectBatch() string {
@@ -257,7 +263,7 @@ AND indexes.STATUS = 'VALID' AND indexes.INDEX_TYPE = 'NORMAL'`
 func (dialect SQLDialect) insertRecord() string {
 	names := []string{"record_id", "name", "dimension_id", "dimension_fields", "dimension_value", "group_interval", "grouped_time", "last_update_time", "expire_time", "counter"}
 	if dialect == SQLOracle {
-		return "INSERT INTO " + dialect.quote(tableName) + " (" + dialect.columns(names...) + ") VALUES (:1, :2, :3, :4, NVL(TO_CLOB(:5), EMPTY_CLOB()), :6, :7, :8, :9, :10)"
+		return "INSERT INTO " + dialect.quote(tableName) + " (" + dialect.columns(names...) + ") VALUES (:1, :2, :3, NVL(TO_CLOB(:4), EMPTY_CLOB()), NVL(TO_CLOB(:5), EMPTY_CLOB()), :6, :7, :8, :9, :10)"
 	}
 	return dialect.insert(tableName, names...)
 }
@@ -282,7 +288,7 @@ func (dialect SQLDialect) upsertRecord() (string, error) {
 		values := make([]string, len(names))
 		for index, name := range names {
 			parameter := dialect.bind(index + 1)
-			if dialect == SQLOracle && name == "dimension_value" {
+			if dialect == SQLOracle && (name == "dimension_fields" || name == "dimension_value") {
 				parameter = "NVL(TO_CLOB(" + parameter + "), EMPTY_CLOB())"
 			}
 			sources[index] = parameter + " AS " + dialect.quote(name)
@@ -308,6 +314,18 @@ func (dialect SQLDialect) upsertRecord() (string, error) {
 	default:
 		return "", fmt.Errorf("unsupported SQL dialect %q", dialect)
 	}
+}
+
+func (dialect SQLDialect) startOracleClob(column string) string {
+	quoted := dialect.quote(column)
+	return "UPDATE " + dialect.quote(tableName) + " SET " + quoted + " = TO_CLOB(:1) WHERE " +
+		dialect.quote("record_id") + " = :2 AND DBMS_LOB.COMPARE(" + quoted + ", TO_CLOB(:3)) = 0"
+}
+
+func (dialect SQLDialect) appendOracleClob(column string) string {
+	quoted := dialect.quote(column)
+	return "UPDATE " + dialect.quote(tableName) + " SET " + quoted + " = " + quoted + " || TO_CLOB(:1) WHERE " +
+		dialect.quote("record_id") + " = :2 AND DBMS_LOB.GETLENGTH(" + quoted + ") = :3"
 }
 
 func (dialect SQLDialect) upsertAssignments(counter, delta, updated, added, clearAfter string) string {
