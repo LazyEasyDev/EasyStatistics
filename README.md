@@ -22,6 +22,9 @@ This example uses SQLite and a local database file. In a Go module, install its 
 go get modernc.org/sqlite
 ```
 
+> [!WARNING]
+> Only explicitly tagged fields participate in statistics. Fields without a `stat` tag, or with `stat:"-"`, are ignored. There is no fallback to the Go field name. A forgotten or misspelled tag can silently exclude a field; dimensions referencing an excluded field cause registration to fail.
+
 ```go
 package main
 
@@ -34,6 +37,11 @@ import (
 	EasyStatistics "github.com/LazyEasyDev/EasyStatistics"
 	_ "modernc.org/sqlite"
 )
+
+type MiningValues struct {
+	User     string `stat:"user"`
+	Activity string `stat:"activity"`
+}
 
 func main() {
 	if err := run(); err != nil {
@@ -53,10 +61,9 @@ func run() error {
 	}
 	defer EasyStatistics.Close()
 
-	score, err := EasyStatistics.NewStatistics(
+	score, err := EasyStatistics.NewStatistics[MiningValues](
 		"mining_score",
-		5*time.Second,
-		[]string{"user", "activity"},
+		time.Minute,
 		[]EasyStatistics.Dimension{
 			{
 				OrderFields:    []string{"user", "activity"},
@@ -73,7 +80,7 @@ func run() error {
 		return err
 	}
 
-	values := map[string]any{"user": "alice", "activity": "mining"}
+	values := MiningValues{User: "alice", Activity: "mining"}
 	if err := score.Add(values, 10); err != nil {
 		return err
 	}
@@ -106,11 +113,33 @@ In a server, initialize and register statistics **once during startup**, keep th
 
 ### Define Dimensions
 
-A statistic declares all input field names. Each dimension selects an ordered subset of those fields and one or more time intervals.
+A statistic derives its input fields from participating `stat` tags on the struct type passed to `NewStatistics[T]`; there is no separate field-name list. `Statistics[T].Add` accepts that same type, so incompatible values and misspelled struct-literal fields are compiler errors. Each dimension selects an ordered subset of the tagged fields and one or more time intervals.
 
-Each field name must be a case-sensitive, non-blank Go identifier (`go/token.IsIdentifier`), at most 255 UTF-8 bytes. Unicode letters are supported. Empty names, whitespace anywhere, punctuation, leading digits, Go keywords, and standalone `_` are rejected with an error. Names are never trimmed or normalized.
+**Statistic names, not values types, must be unique within the current service.** The same `T` can be registered under different names, even with identical dimensions. Each named statistic has its own buffer, worker, update interval, and retention configuration; persisted keys include the statistic name, so counters remain separate. Calling `NewStatistics[T]` with an existing name returns an error instead of changing that statistic. Use `GetStatistics[T](name)` to retrieve its existing handle.
 
-Declared `fields` must not contain duplicates. Each `Dimension.OrderFields` must be a nonempty ordered subset of the declared fields, without duplicates. A field may be reused in different dimensions. Query headers (`OrderField.Name`) must match a configured dimension exactly, including case and order. These restrictions apply to field names, not their values; statistic-name rules are unchanged.
+> [!WARNING]
+> Untagged fields and fields with exactly `stat:"-"` are skipped both at registration and in `Add`, even if they have unsupported types. Nothing is inferred from the Go field name. Use explicit tags for every field you intend to collect, and check that dimensions reference their exact tag text.
+
+`T` must be a non-pointer struct with at least one participating field. Participating fields must be exported, non-embedded strings, booleans, signed or unsigned integers, including `uintptr`, or named types with those underlying kinds. Registration rejects participating fields with unsupported types, including floats, interfaces, pointers, slices, maps, and nested structs. Ignored fields may have any type; ignored embedded structs are not traversed, even if their inner fields have tags. Struct shape and participating field types are validated once at registration; they are not expressible as a Go generic constraint.
+
+| Struct Field Tag | Behavior |
+| --- | --- |
+| No `stat` tag | Ignore the field |
+| `stat:"-"` | Ignore the field |
+| `stat:"user"` | Collect the field with the name `user` |
+| `stat:""` | Registration error, not a skip |
+
+Participating tag names must contain **1 to 255 ASCII characters**, start with an uppercase or lowercase letter, and contain only letters, digits, or underscores thereafter:
+
+```text
+^[A-Za-z][A-Za-z0-9_]*$
+```
+
+Names are **case-sensitive**: `Xx` and `xx` are valid, distinct names; `1X` is invalid because it starts with a digit. Leading or trailing spaces, whitespace anywhere, Unicode, colons, asterisks, and other punctuation are rejected. Options such as `stat:"user,omitempty"` are unsupported. Names are never trimmed or case-converted. These restrictions apply to tag names only, not field values or statistic names.
+
+Participating tag names must not contain duplicates. Each `Dimension.OrderFields` must be a nonempty ordered subset of these names, without duplicates. **Every item must match a participating tag exactly, including case.** Referencing an ignored field, the Go field name instead of its tag, or a different capitalization causes `NewStatistics[T]` to return an error. A field may be reused in different dimensions.
+
+Struct declaration order and keyed struct-literal order do not determine stored keys; `Dimension.OrderFields` does. For example, `{"user", "activity"}` and `{"activity", "user"}` identify different dimensions. Query headers (`OrderField.Name`) must match a configured dimension exactly, including case and order. Dimension and query names remain runtime-validated strings. When retaining existing counters or renaming a Go field, keep its tag name and dimension order unchanged: changing them changes persisted dimension and record keys.
 
 The quick start updates three counters for each addition:
 
@@ -120,36 +149,49 @@ The quick start updates three counters for each addition:
 | `user`, `activity` | `GroupForever` | All-time score for that user's activity |
 | `user` | `GroupForever` | All-time score across that user's activities |
 
-Values are not predeclared: new users and activities can arrive through `Add`. The update interval must be positive. An ordered field sequence may appear only once per statistic; put all its intervals in the same dimension.
+Values are not predeclared: new users and activities can arrive through `Add`. An ordered field sequence may appear only once per statistic; put all its intervals in the same dimension.
+
+### Choose An Upload Interval
+
+`updateInterval` controls the normal wait before an upload and after each completed upload. Use **60 seconds to 1 hour** as the recommended range:
+
+| Limit | Behavior |
+| --- | --- |
+| Minimum: **60 seconds** (`time.Minute`) | Enforced by `NewStatistics[T]`; smaller values return an error |
+| Recommended maximum: **1 hour** (`time.Hour`) | Guidance only; larger values are accepted |
+
+On elastic deployments, many instances may start, stop, or scale frequently. The 60-second minimum lets routine additions accumulate instead of issuing frequent SQL transactions, reducing database burden. `Close` still starts final draining immediately without waiting for `updateInterval`, so frequent instance restarts can still generate extra writes.
+
+Keep the interval at or below one hour to limit how much data remains only in memory: longer intervals increase potential data loss if an instance crashes or is terminated before graceful draining finishes. This is a recommendation, not a durability guarantee or a hard one-hour loss window; SQL delays and retries can leave data buffered longer. Stop producers and allow `Close` to finish during planned shutdowns.
 
 ### Add Counters
 
 ```go
-if err := score.Add(map[string]any{"user": "alice", "activity": "mining"}, 10); err != nil {
+if err := score.Add(MiningValues{User: "alice", Activity: "mining"}, 10); err != nil {
 	return err
 }
 ```
 
-- Supply exactly the declared fields, even when querying a dimension that uses only some of them. Input map order does not matter.
-- Use strings, booleans, signed or unsigned integers, including `uintptr`, or named types with those underlying kinds. Floats, nil, pointers, slices, maps, structs, and complex values are rejected.
-- Values normalize to strings: `int(7)`, `uint64(7)`, and `"7"` identify the same value. Likewise, `true` and `"true"` match. Strings must be valid UTF-8. An empty value such as `map[string]any{"user": ""}` is valid; missing or nil values are not. Value strings are not trimmed, so `""` and `" "` identify different values.
+- Pass a value of the registered struct type. Go permits omitted struct-literal fields: they take their zero values, rather than producing a missing-field error. `MiningValues{}` therefore supplies two valid empty strings.
+- Field types are fixed by the struct. Registration validates supported kinds for participating fields, and the compiler checks assignments to them.
+- Values normalize to strings: a numeric field holding `7` matches a query using `"7"`; `true` similarly matches `"true"`. Strings must be valid UTF-8. Empty strings, false, and zero integers are valid values. Value strings are not trimmed, so `""` and `" "` identify different values.
 - Positive, negative, and zero deltas are accepted. Deltas and totals are `int64`; **keep accumulated totals within its range**. Arithmetic is not checked for overflow and can wrap.
-- `Add` performs no SQL work. It can be called concurrently, but callers must not modify an input map while it is being read.
+- `Add` performs no SQL work and can be called concurrently. It reads only participating fields from the supplied struct value.
 
 **If `Add` observes a closing or closed service, it returns nil and ignores the addition.** This also applies to old statistics handles after reinitialization; they do not send updates to the new service. The check before modifying the buffer also ignores a call that observes shutdown after preparing its changes.
 
-This is intentional for high-frequency, best-effort statistics: request goroutines may still report counters during shutdown, and returning a closed-service error for every call could flood application logs. Invalid fields and values still return errors while the service is running, so input-format mistakes can be caught during development and testing. **A nil return is not a persistence guarantee:** ignored additions are neither buffered nor uploaded. Stop producers before calling `Close` when their final additions must be accepted.
+This is intentional for high-frequency, best-effort statistics: request goroutines may still report counters during shutdown, and returning a closed-service error for every call could flood application logs. Unsupported struct schemas return registration errors; invalid UTF-8 values return errors from `Add` while the service is running. **A nil return is not a persistence guarantee:** ignored additions are neither buffered nor uploaded. Stop producers before calling `Close` when their final additions must be accepted.
 
 ### Find A Registered Statistic
 
 ```go
-score, err := EasyStatistics.GetStatistics("mining_score")
+score, err := EasyStatistics.GetStatistics[MiningValues]("mining_score")
 if err != nil {
 	return err
 }
 ```
 
-This returns the same instance created by `NewStatistics`. It does not create another worker or read SQL. An unknown name, an uninitialized library, or a closing or closed service returns an error.
+This returns the same typed instance created by `NewStatistics`. Use the same values type; a different named struct type is rejected even if it has the same fields. It does not create another worker or read SQL. An unknown name, a mismatched values type, an uninitialized library, or a closing or closed service returns an error.
 
 ### Query Counters
 
@@ -183,7 +225,7 @@ All queries read **uploaded SQL data only**. A missing row returns `(nil, nil)`;
 
 ### Choose Time Buckets
 
-Only the following groups are supported. Registration and queries reject `"SECOND"`, `"MINUTE"`, and `"HOUR"`, even when explicitly cast to `GroupInterval`. Grouping is independent of `updateInterval`: short upload intervals remain supported and do not create finer-grained buckets.
+Only the following groups are supported. Registration and queries reject `"SECOND"`, `"MINUTE"`, and `"HOUR"`, even when explicitly cast to `GroupInterval`. Grouping is independent of `updateInterval`: uploads every 60 seconds or longer do not create finer-grained buckets.
 
 | Constant | Example For `Get` |
 | --- | --- |
@@ -270,21 +312,23 @@ SQL dialect support is implemented for the databases above; it is not a claim th
 
 ```text
 Init(database *sql.DB, dialect SQLDialect) error
-NewStatistics(name string, updateInterval time.Duration, fields []string, dimensions []Dimension) (*Statistics, error)
-GetStatistics(name string) (*Statistics, error)
+NewStatistics[T any](name string, updateInterval time.Duration, dimensions []Dimension) (*Statistics[T], error)
+GetStatistics[T any](name string) (*Statistics[T], error)
 Close() error
 
-(*Statistics).Add(values map[string]any, delta int64) error
-(*Statistics).Get(orderFields []OrderField, interval GroupInterval, groupedTime string) (*Record, error)
-(*Statistics).GetWithTime(orderFields []OrderField, interval GroupInterval, timestamp time.Time) (*Record, error)
-(*Statistics).GetWithUnixTimeSecond(orderFields []OrderField, interval GroupInterval, timestamp int64) (*Record, error)
+(*Statistics[T]).Add(values T, delta int64) error
+(*Statistics[T]).Get(orderFields []OrderField, interval GroupInterval, groupedTime string) (*Record, error)
+(*Statistics[T]).GetWithTime(orderFields []OrderField, interval GroupInterval, timestamp time.Time) (*Record, error)
+(*Statistics[T]).GetWithUnixTimeSecond(orderFields []OrderField, interval GroupInterval, timestamp int64) (*Record, error)
 ```
 
-Only one service can be running or draining at a time. After `Close` completes, `Init` may create a fresh service using the same or a different database pool. A failed initialization may be retried. Old statistics handles remain closed; re-register definitions after reinitialization or a process restart. Persisted counters remain in their original database. Statistic names must be unique within the current service; names and field names must contain 1 to 255 UTF-8 bytes, with no surrounding whitespace or control characters. Configuration slices are copied at registration.
+Only one service can be running or draining at a time. After `Close` completes, `Init` may create a fresh service using the same or a different database pool. A failed initialization may be retried. Old statistics handles remain closed; re-register definitions after reinitialization or a process restart. Persisted counters remain in their original database. Statistic names must be unique within the current service and contain 1 to 255 UTF-8 bytes, with no surrounding whitespace or control characters. Field names follow the stricter `stat` tag rules above. Configuration slices are copied at registration.
 
 ## Design Notes
 
-Dialect helpers in [dialect.go](dialect.go) generate SQL using only `SQLDialect`; they do not depend on the database backend. [sql.go](sql.go) owns SQL execution, transactions, batch identity, timeouts, and upload retries. [statistics.go](statistics.go) owns buffering, the normal update interval, and final draining. [store.go](store.go) owns the service lifecycle and global cleanup worker.
+Dialect helpers in [dialect.go](dialect.go) generate SQL using only `SQLDialect`; they do not depend on the database backend. [sql.go](sql.go) owns SQL execution, transactions, batch identity, timeouts, and upload retries. [statistics.go](statistics.go) owns struct-field validation, typed input, buffering, the normal update interval, and final draining. [store.go](store.go) owns the service lifecycle, typed name lookup, and global cleanup worker.
+
+`Statistics[T]` is a thin typed handle over a non-generic counter core. Participating tag names and their original struct-field indexes are cached at registration; `Add` reads only those fields through reflection before the existing normalization and buffering steps. This preserves the correct name-to-value mapping when other fields are skipped. The SQL backend and persisted identity format do not depend on the Go values type. This improves caller-side type checking without claiming a performance improvement.
 
 `runCleanup` owns cleanup scheduling, the fixed application-time cutoff for each sweep, the repeat-until-short-batch loop, failure handling, and shutdown checks. The SQL backend's `cleanup` method attempts exactly one deletion batch and returns its affected-row count and error; it does not schedule, repeat, or inspect the service's closing signal. Old batch-marker pruning is a separate SQL operation called by the worker.
 

@@ -5,9 +5,9 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"go/token"
 	"hash/fnv"
 	"net/url"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -16,17 +16,29 @@ import (
 	"unicode/utf8"
 )
 
-const shardNum = 8
+const (
+	shardNum          = 8
+	minUpdateInterval = time.Minute
+)
 
-type Statistics struct {
+type Statistics[T any] struct {
+	*statistics
+}
+
+type statistics struct {
 	name           string
-	fields         []string
+	fields         []statisticField
 	dimensions     []Dimension
 	rowsPerAdd     int
 	updateInterval time.Duration
 	service        *service
 	shards         [shardNum]counterShard
 	pending        *uploadBatch
+}
+
+type statisticField struct {
+	name  string
+	index int
 }
 
 type counterShard struct {
@@ -72,22 +84,67 @@ func validateIdentifier(name string) error {
 	return nil
 }
 
-func validateDefinition(name string, updateInterval time.Duration, fields []string, dimensions []Dimension) ([]string, []Dimension, error) {
+func fieldsFor(valueType reflect.Type) ([]statisticField, error) {
+	if valueType.Kind() != reflect.Struct {
+		return nil, errors.New("statistics values must be a non-pointer struct")
+	}
+	fields := make([]statisticField, 0, valueType.NumField())
+	for index := 0; index < valueType.NumField(); index++ {
+		field := valueType.Field(index)
+		name, exists := field.Tag.Lookup("stat")
+		if !exists || name == "-" {
+			continue
+		}
+		if field.PkgPath != "" || field.Anonymous {
+			return nil, fmt.Errorf("statistics field %q must be exported and not embedded", field.Name)
+		}
+		switch field.Type.Kind() {
+		case reflect.String, reflect.Bool,
+			reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+			reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		default:
+			return nil, fmt.Errorf("statistics field %q has unsupported type %v: use strings, booleans, or integers", field.Name, field.Type)
+		}
+		fields = append(fields, statisticField{name: name, index: index})
+	}
+	if len(fields) == 0 {
+		return nil, errors.New("statistics values require at least one field with a non-skipped stat tag")
+	}
+	return fields, nil
+}
+
+func validStatName(name string) bool {
+	if len(name) == 0 || len(name) > 255 {
+		return false
+	}
+	for index, character := range name {
+		if (character >= 'A' && character <= 'Z') || (character >= 'a' && character <= 'z') {
+			continue
+		}
+		if index > 0 && ((character >= '0' && character <= '9') || character == '_') {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func validateDefinition(name string, updateInterval time.Duration, fields []statisticField, dimensions []Dimension) ([]statisticField, []Dimension, error) {
 	if err := validateIdentifier(name); err != nil {
 		return nil, nil, err
 	}
-	if updateInterval <= 0 || len(fields) == 0 || len(dimensions) == 0 {
-		return nil, nil, errors.New("positive update interval, fields, and dimensions are required")
+	if updateInterval < minUpdateInterval || len(fields) == 0 || len(dimensions) == 0 {
+		return nil, nil, errors.New("update interval of at least 60 seconds, fields, and dimensions are required")
 	}
 	known := make(map[string]bool, len(fields))
 	for _, field := range fields {
-		if len(field) > 255 || field == "_" || !token.IsIdentifier(field) {
-			return nil, nil, fmt.Errorf("statistics field %q must be a non-blank Go identifier of at most 255 bytes", field)
+		if !validStatName(field.name) {
+			return nil, nil, fmt.Errorf("statistics stat tag %q must contain 1 to 255 ASCII characters, start with a letter, and contain only letters, digits, or underscores", field.name)
 		}
-		if known[field] {
-			return nil, nil, fmt.Errorf("repeated statistics field %q", field)
+		if known[field.name] {
+			return nil, nil, fmt.Errorf("repeated statistics field %q", field.name)
 		}
-		known[field] = true
+		known[field.name] = true
 	}
 	seenDimensions := make(map[string]bool, len(dimensions))
 	copied := make([]Dimension, len(dimensions))
@@ -130,10 +187,14 @@ func validateDefinition(name string, updateInterval time.Duration, fields []stri
 			id:             dimensionID(name, identity),
 		}
 	}
-	return append([]string(nil), fields...), copied, nil
+	return append([]statisticField(nil), fields...), copied, nil
 }
 
-func (initialized *service) newStatistics(name string, updateInterval time.Duration, fields []string, dimensions []Dimension) (*Statistics, error) {
+func newStatistics[T any](initialized *service, name string, updateInterval time.Duration, dimensions []Dimension) (*Statistics[T], error) {
+	fields, err := fieldsFor(reflect.TypeOf((*T)(nil)).Elem())
+	if err != nil {
+		return nil, err
+	}
 	copiedFields, copiedDimensions, err := validateDefinition(name, updateInterval, fields, dimensions)
 	if err != nil {
 		return nil, err
@@ -142,11 +203,11 @@ func (initialized *service) newStatistics(name string, updateInterval time.Durat
 	for _, dimension := range copiedDimensions {
 		rowsPerAdd += len(dimension.GroupIntervals)
 	}
-	statistic := &Statistics{
+	statistic := &Statistics[T]{statistics: &statistics{
 		name: name, fields: copiedFields, dimensions: copiedDimensions,
 		rowsPerAdd: rowsPerAdd, updateInterval: updateInterval,
 		service: initialized,
-	}
+	}}
 	for index := range statistic.shards {
 		statistic.shards[index].active = make(map[counterKey]counterRow)
 	}
@@ -166,25 +227,19 @@ func (initialized *service) newStatistics(name string, updateInterval time.Durat
 	return statistic, nil
 }
 
-func (statistic *Statistics) Add(values map[string]any, delta int64) error {
+func (statistic *Statistics[T]) Add(values T, delta int64) error {
 	initialized := statistic.service
 	if initialized.isClosing() {
 		return nil
 	}
-	if len(values) != len(statistic.fields) {
-		return errors.New("Add requires exactly the declared statistics fields")
-	}
-	encoded := make(map[string]string, len(values))
+	reflected := reflect.ValueOf(values)
+	encoded := make(map[string]string, len(statistic.fields))
 	for _, field := range statistic.fields {
-		value, exists := values[field]
-		if !exists {
-			return fmt.Errorf("missing statistics field %q", field)
-		}
-		text, err := normalizeValue(value)
+		text, err := normalizeValue(reflected.Field(field.index).Interface())
 		if err != nil {
-			return fmt.Errorf("field %q: %w", field, err)
+			return fmt.Errorf("field %q: %w", field.name, err)
 		}
-		encoded[field] = url.QueryEscape(text)
+		encoded[field.name] = url.QueryEscape(text)
 	}
 	timestamp := time.Now().UTC()
 	var localChanges [8]counterChange
@@ -246,7 +301,7 @@ func (statistic *Statistics) Add(values map[string]any, delta int64) error {
 	return nil
 }
 
-func (statistic *Statistics) GetWithTime(orderFields []OrderField, interval GroupInterval, timestamp time.Time) (*Record, error) {
+func (statistic *statistics) GetWithTime(orderFields []OrderField, interval GroupInterval, timestamp time.Time) (*Record, error) {
 	bucket, label, err := bucketFor(interval, timestamp)
 	if err != nil {
 		return nil, err
@@ -254,11 +309,11 @@ func (statistic *Statistics) GetWithTime(orderFields []OrderField, interval Grou
 	return statistic.get(orderFields, interval, bucket, label)
 }
 
-func (statistic *Statistics) GetWithUnixTimeSecond(orderFields []OrderField, interval GroupInterval, timestamp int64) (*Record, error) {
+func (statistic *statistics) GetWithUnixTimeSecond(orderFields []OrderField, interval GroupInterval, timestamp int64) (*Record, error) {
 	return statistic.GetWithTime(orderFields, interval, time.Unix(timestamp, 0))
 }
 
-func (statistic *Statistics) Get(orderFields []OrderField, interval GroupInterval, groupedTime string) (*Record, error) {
+func (statistic *statistics) Get(orderFields []OrderField, interval GroupInterval, groupedTime string) (*Record, error) {
 	bucket, label, err := parseBucket(interval, groupedTime)
 	if err != nil {
 		return nil, err
@@ -266,7 +321,7 @@ func (statistic *Statistics) Get(orderFields []OrderField, interval GroupInterva
 	return statistic.get(orderFields, interval, bucket, label)
 }
 
-func (statistic *Statistics) get(orderFields []OrderField, interval GroupInterval, bucket int64, label string) (*Record, error) {
+func (statistic *statistics) get(orderFields []OrderField, interval GroupInterval, bucket int64, label string) (*Record, error) {
 	initialized := statistic.service
 	if initialized.isClosing() {
 		return nil, errors.New("EasyStatistics is closed")
@@ -394,7 +449,7 @@ func parseBucket(interval GroupInterval, label string) (int64, string, error) {
 	return bucket, canonical, err
 }
 
-func (statistic *Statistics) nextBatch() *uploadBatch {
+func (statistic *statistics) nextBatch() *uploadBatch {
 	if statistic.pending != nil {
 		return statistic.pending
 	}
@@ -434,7 +489,7 @@ func (statistic *Statistics) nextBatch() *uploadBatch {
 	return batch
 }
 
-func (statistic *Statistics) upload(batch *uploadBatch) error {
+func (statistic *statistics) upload(batch *uploadBatch) error {
 	if err := statistic.service.backend.submit(statistic.service.ctx, batch); err != nil {
 		return err
 	}
@@ -442,7 +497,7 @@ func (statistic *Statistics) upload(batch *uploadBatch) error {
 	return nil
 }
 
-func (statistic *Statistics) run() {
+func (statistic *statistics) run() {
 	defer statistic.service.workers.Done()
 	timer := time.NewTimer(statistic.updateInterval)
 	defer timer.Stop()

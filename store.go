@@ -24,7 +24,7 @@ type service struct {
 	ctx        context.Context
 	cancel     context.CancelFunc
 	mu         sync.Mutex
-	statistics map[string]*Statistics
+	statistics map[string]any
 	closing    chan struct{}
 	workers    sync.WaitGroup
 }
@@ -66,7 +66,7 @@ func newService(backend *sqlBackend) *service {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &service{
 		backend: backend, ctx: ctx, cancel: cancel,
-		statistics: make(map[string]*Statistics), closing: make(chan struct{}),
+		statistics: make(map[string]any), closing: make(chan struct{}),
 	}
 }
 
@@ -131,27 +131,31 @@ func currentService() (*service, error) {
 	return initialized, nil
 }
 
-func NewStatistics(name string, updateInterval time.Duration, fields []string, dimensions []Dimension) (*Statistics, error) {
+func NewStatistics[T any](name string, updateInterval time.Duration, dimensions []Dimension) (*Statistics[T], error) {
 	initialized, err := currentService()
 	if err != nil {
 		return nil, err
 	}
-	return initialized.newStatistics(name, updateInterval, fields, dimensions)
+	return newStatistics[T](initialized, name, updateInterval, dimensions)
 }
 
-func GetStatistics(name string) (*Statistics, error) {
+func GetStatistics[T any](name string) (*Statistics[T], error) {
 	initialized, err := currentService()
 	if err != nil {
 		return nil, err
 	}
 	initialized.mu.Lock()
-	statistic := initialized.statistics[name]
+	registered := initialized.statistics[name]
 	initialized.mu.Unlock()
 	if initialized.isClosing() {
 		return nil, errors.New("EasyStatistics is closed")
 	}
-	if statistic == nil {
+	if registered == nil {
 		return nil, fmt.Errorf("statistics %q does not exist", name)
+	}
+	statistic, matches := registered.(*Statistics[T])
+	if !matches {
+		return nil, fmt.Errorf("statistics %q has a different values type (registered %T)", name, registered)
 	}
 	return statistic, nil
 }
