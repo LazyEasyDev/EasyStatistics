@@ -306,7 +306,11 @@ The Oracle insert explicitly stores an empty dimension value as a non-null empty
 
 Native upsert or `MERGE` support is required. `SQLGaussDB` uses the openGauss-compatible `ON DUPLICATE KEY UPDATE` syntax with `EXCLUDED` references. Keep `record_id` as the counter table's only unique key: additional unique constraints can make MySQL-family or GaussDB upserts match a different logical record.
 
+SQL Server casts generated ASCII record and batch key parameters to the schema's matching `VARCHAR` widths. This keeps Unicode parameter bindings from converting indexed key columns and forcing scans. With `go-mssqldb`, leave `connection timeout=0` and use SQL contexts for operation deadlines; use its separate `dial timeout` to bound connection establishment.
+
 SQL dialect support is implemented for the databases above; it is not a claim that every driver or server version has been live-tested. SQLite and local MySQL 8.4.11 with `go-sql-driver/mysql` 1.10.1 were exercised during development. MySQL checks used isolated tables and covered transactions, retries, expiry cleanup, and the public API. Validate your chosen driver and deployment before production use.
+
+SQL Server 2022 CU27 (16.0.4295.3) with `go-mssqldb` 1.11.2 was also exercised against a real local engine, including transaction rollback, expiry cleanup, lost-successful-reply recovery, and first-write/replay campaigns up to eight processes and 512 Add callers. The engine ran through Rosetta on Apple Silicon, which Microsoft does not support; these checks do not certify native deployment performance.
 
 ## API Reference
 

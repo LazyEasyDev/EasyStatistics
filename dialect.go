@@ -153,6 +153,14 @@ func (dialect SQLDialect) bind(index int) string {
 	}
 }
 
+func (dialect SQLDialect) bindKey(index, length int) string {
+	parameter := dialect.bind(index)
+	if dialect == SQLServer {
+		return fmt.Sprintf("CAST(%s AS VARCHAR(%d))", parameter, length)
+	}
+	return parameter
+}
+
 func (dialect SQLDialect) columns(names ...string) string {
 	quoted := make([]string, len(names))
 	for index, name := range names {
@@ -176,11 +184,11 @@ func (dialect SQLDialect) selectRecord() string {
 		// the actual SQL nullness available so corrupt nullable schemas fail.
 		columns += ", CASE WHEN " + dialect.quote("dimension_value") + " IS NULL THEN 1 ELSE 0 END"
 	}
-	return "SELECT " + columns + " FROM " + dialect.quote(tableName) + " WHERE " + dialect.quote("record_id") + " = " + dialect.bind(1)
+	return "SELECT " + columns + " FROM " + dialect.quote(tableName) + " WHERE " + dialect.quote("record_id") + " = " + dialect.bindKey(1, 64)
 }
 
 func (dialect SQLDialect) selectBatch() string {
-	return "SELECT " + dialect.quote("batch_id") + " FROM " + dialect.quote(batchTableName) + " WHERE " + dialect.quote("batch_id") + " = " + dialect.bind(1)
+	return "SELECT " + dialect.quote("batch_id") + " FROM " + dialect.quote(batchTableName) + " WHERE " + dialect.quote("batch_id") + " = " + dialect.bindKey(1, 96)
 }
 
 func (dialect SQLDialect) insertBatch() string {
@@ -188,7 +196,7 @@ func (dialect SQLDialect) insertBatch() string {
 }
 
 func (dialect SQLDialect) deleteBatch() string {
-	return "DELETE FROM " + dialect.quote(batchTableName) + " WHERE " + dialect.quote("batch_id") + " = " + dialect.bind(1)
+	return "DELETE FROM " + dialect.quote(batchTableName) + " WHERE " + dialect.quote("batch_id") + " = " + dialect.bindKey(1, 96)
 }
 
 func (dialect SQLDialect) pruneBatches() string {
@@ -288,6 +296,9 @@ func (dialect SQLDialect) upsertRecord() (string, error) {
 		values := make([]string, len(names))
 		for index, name := range names {
 			parameter := dialect.bind(index + 1)
+			if name == "record_id" {
+				parameter = dialect.bindKey(index+1, 64)
+			}
 			if dialect == SQLOracle && (name == "dimension_fields" || name == "dimension_value") {
 				parameter = "NVL(TO_CLOB(" + parameter + "), EMPTY_CLOB())"
 			}
