@@ -88,11 +88,10 @@ func run() error {
 		return err
 	}
 
-	record, err := score.Get(
-		[]EasyStatistics.OrderField{{Name: "user", Value: "alice"}},
-		EasyStatistics.GroupForever,
-		"forever",
-	)
+	record, err := score.Query().
+		Field("user", "alice").
+		GroupInterval(EasyStatistics.GroupForever).
+		Get()
 	if err != nil {
 		return err
 	}
@@ -198,11 +197,12 @@ This returns the same typed instance created by `NewStatistics`. Use the same va
 Choose exactly one configured dimension, preserve its field order, and use one of its configured intervals:
 
 ```go
-fields := []EasyStatistics.OrderField{
-	{Name: "user", Value: "alice"},
-	{Name: "activity", Value: "mining"},
-}
-record, err := score.GetWithTime(fields, EasyStatistics.GroupMonth, time.Now())
+record, err := score.Query().
+	Field("user", "alice").
+	Field("activity", "mining").
+	GroupInterval(EasyStatistics.GroupMonth).
+	GroupTime(time.Now()).
+	Get()
 if err != nil {
 	return err
 }
@@ -211,13 +211,17 @@ if record != nil {
 }
 ```
 
-The three query methods differ only in how you select the bucket:
+Each `Query()` returns a fresh mutable builder. `Field(name, value)` appends a field in call order, using its `stat` tag name. `GroupInterval` and `GroupTime` replace their previous selections. Validation and SQL execution happen only when you call `Get()`. The builder can be reused, but do not modify it concurrently; use separate builders for independently configured queries.
 
-| Method | Bucket Input |
-| --- | --- |
-| `GetWithTime` | A `time.Time`, converted to UTC |
-| `GetWithUnixTimeSecond` | Unix seconds, not milliseconds |
-| `Get` | A canonical bucket string from the table below |
+`GroupInterval` is required. `GroupTime` is required for day, week, month, and year queries, but **optional for `GroupForever`**. It accepts these input types:
+
+| Type | Example | Bucket Input |
+| --- | --- | --- |
+| `string` | `GroupTime("2026-10")` | A canonical bucket string from the table below |
+| `time.Time` | `GroupTime(time.Now())` | A time converted to UTC |
+| `int64` | `GroupTime(time.Now().Unix())` | Unix seconds, not milliseconds |
+
+Unsupported time types return an error from `Get()`, including when explicitly supplied for `GroupForever`.
 
 All queries read **uploaded SQL data only**. A missing row returns `(nil, nil)`; a stored zero counter returns a non-nil record. Invalid input or a database failure returns an error.
 
@@ -227,7 +231,7 @@ All queries read **uploaded SQL data only**. A missing row returns `(nil, nil)`;
 
 Only the following groups are supported. Registration and queries reject `"SECOND"`, `"MINUTE"`, and `"HOUR"`, even when explicitly cast to `GroupInterval`. Grouping is independent of `updateInterval`: uploads every 60 seconds or longer do not create finer-grained buckets.
 
-| Constant | Example For `Get` |
+| Constant | String Example For `GroupTime` |
 | --- | --- |
 | `GroupDay` | `2026-10-07` |
 | `GroupWeek` | `2026-W41` |
@@ -235,7 +239,7 @@ Only the following groups are supported. Registration and queries reject `"SECON
 | `GroupYear` | `2026` |
 | `GroupForever` | `forever` |
 
-All buckets use UTC. Weeks start on Monday and follow ISO week years. `GroupForever` ignores timestamps; its string form accepts `forever` or `FOREVER`. `Add` uses the current local call time, with no caller-supplied event timestamp.
+All buckets use UTC. Weeks start on Monday and follow ISO week years. `GroupForever` needs no time selection; if supplied, timestamps are ignored and its string form accepts `forever` or `FOREVER`. `Add` uses the current local call time, with no caller-supplied event timestamp.
 
 ### Expire Inactive Records
 
@@ -321,16 +325,19 @@ GetStatistics[T any](name string) (*Statistics[T], error)
 Close() error
 
 (*Statistics[T]).Add(values T, delta int64) error
-(*Statistics[T]).Get(orderFields []OrderField, interval GroupInterval, groupedTime string) (*Record, error)
-(*Statistics[T]).GetWithTime(orderFields []OrderField, interval GroupInterval, timestamp time.Time) (*Record, error)
-(*Statistics[T]).GetWithUnixTimeSecond(orderFields []OrderField, interval GroupInterval, timestamp int64) (*Record, error)
+(*Statistics[T]).Query() *Query
+
+(*Query).Field(name string, value any) *Query
+(*Query).GroupInterval(interval GroupInterval) *Query
+(*Query).GroupTime(value any) *Query
+(*Query).Get() (*Record, error)
 ```
 
 Only one service can be running or draining at a time. After `Close` completes, `Init` may create a fresh service using the same or a different database pool. A failed initialization may be retried. Old statistics handles remain closed; re-register definitions after reinitialization or a process restart. Persisted counters remain in their original database. Statistic names must be unique within the current service and contain 1 to 255 UTF-8 bytes, with no surrounding whitespace or control characters. Field names follow the stricter `stat` tag rules above. Configuration slices are copied at registration.
 
 ## Design Notes
 
-Dialect helpers in [dialect.go](dialect.go) generate SQL using only `SQLDialect`; they do not depend on the database backend. [sql.go](sql.go) owns SQL execution, transactions, batch identity, timeouts, and upload retries. [statistics.go](statistics.go) owns struct-field validation, typed input, buffering, the normal update interval, and final draining. [store.go](store.go) owns the service lifecycle, typed name lookup, and global cleanup worker.
+Dialect helpers in [dialect.go](dialect.go) generate SQL using only `SQLDialect`; they do not depend on the database backend. [sql.go](sql.go) owns SQL execution, transactions, batch identity, timeouts, and upload retries. [statistics.go](statistics.go) owns struct-field validation, typed input, buffering, the normal update interval, and final draining. [query.go](query.go) provides the fluent query builder and checks its time input before using the existing bucket and record lookup logic. [store.go](store.go) owns the service lifecycle, typed name lookup, and global cleanup worker.
 
 `Statistics[T]` is a thin typed handle over a non-generic counter core. Participating tag names and their original struct-field indexes are cached at registration; `Add` reads only those fields through reflection before the existing normalization and buffering steps. This preserves the correct name-to-value mapping when other fields are skipped. The SQL backend and persisted identity format do not depend on the Go values type. This improves caller-side type checking without claiming a performance improvement.
 

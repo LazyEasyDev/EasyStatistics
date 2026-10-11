@@ -301,24 +301,8 @@ func (statistic *Statistics[T]) Add(values T, delta int64) error {
 	return nil
 }
 
-func (statistic *statistics) GetWithTime(orderFields []OrderField, interval GroupInterval, timestamp time.Time) (*Record, error) {
-	bucket, label, err := bucketFor(interval, timestamp)
-	if err != nil {
-		return nil, err
-	}
-	return statistic.get(orderFields, interval, bucket, label)
-}
-
-func (statistic *statistics) GetWithUnixTimeSecond(orderFields []OrderField, interval GroupInterval, timestamp int64) (*Record, error) {
-	return statistic.GetWithTime(orderFields, interval, time.Unix(timestamp, 0))
-}
-
-func (statistic *statistics) Get(orderFields []OrderField, interval GroupInterval, groupedTime string) (*Record, error) {
-	bucket, label, err := parseBucket(interval, groupedTime)
-	if err != nil {
-		return nil, err
-	}
-	return statistic.get(orderFields, interval, bucket, label)
+func (statistic *statistics) Query() *Query {
+	return &Query{statistic: statistic}
 }
 
 func (statistic *statistics) get(orderFields []OrderField, interval GroupInterval, bucket int64, label string) (*Record, error) {
