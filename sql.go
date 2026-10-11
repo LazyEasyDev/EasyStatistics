@@ -171,6 +171,9 @@ func (backend *sqlBackend) getRow(identity string) (counterRow, error) {
 			return row, errors.New("stored dimension value is NULL")
 		}
 		row.value = value.String
+		if backend.dialect == SQLGaussDB && row.value == gaussEmptyValue {
+			row.value = ""
+		}
 	}
 	return row, err
 }

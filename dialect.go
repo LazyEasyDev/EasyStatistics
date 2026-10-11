@@ -22,6 +22,7 @@ const (
 	tableName       = "easy_statistics"
 	batchTableName  = "easy_statistics_batches"
 	expiryIndexName = "easy_statistics_expire_idx"
+	gaussEmptyValue = "!"
 )
 
 func schemaFor(dialect SQLDialect) ([]string, error) {
@@ -171,8 +172,11 @@ func (dialect SQLDialect) columns(names ...string) string {
 
 func (dialect SQLDialect) insert(table string, names ...string) string {
 	parameters := make([]string, len(names))
-	for index := range names {
+	for index, name := range names {
 		parameters[index] = dialect.bind(index + 1)
+		if dialect == SQLGaussDB && name == "dimension_value" {
+			parameters[index] = "COALESCE(NULLIF(" + parameters[index] + ", ''), '" + gaussEmptyValue + "')"
+		}
 	}
 	return "INSERT INTO " + dialect.quote(table) + " (" + dialect.columns(names...) + ") VALUES (" + strings.Join(parameters, ", ") + ")"
 }
