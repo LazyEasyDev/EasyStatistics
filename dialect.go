@@ -286,9 +286,6 @@ AND indexes.STATUS = 'VALID' AND indexes.INDEX_TYPE = 'NORMAL'`
 
 func (dialect SQLDialect) insertRecord() string {
 	names := []string{"record_id", "name", "dimension_id", "dimension_fields", "dimension_value", "group_interval", "grouped_time", "last_update_time", "expire_time", "counter"}
-	if dialect == SQLOracle {
-		return "INSERT INTO " + dialect.quote(tableName) + " (" + dialect.columns(names...) + ") VALUES (:1, :2, :3, NVL(TO_CLOB(:4), EMPTY_CLOB()), NVL(TO_CLOB(:5), EMPTY_CLOB()), :6, :7, :8, :9, :10)"
-	}
 	return dialect.insert(tableName, names...)
 }
 
