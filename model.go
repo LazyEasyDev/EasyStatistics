@@ -27,8 +27,8 @@ type Dimension struct {
 	OrderFields    []string        `json:"order_fields"`
 	GroupIntervals []GroupInterval `json:"group_intervals"`
 	ClearAfter     time.Duration   `json:"clear_after"`
+	Count          int64           `json:"count"`
 	encodedFields  string
-	id             string
 }
 
 type StatisticsDefinition struct {
@@ -36,6 +36,12 @@ type StatisticsDefinition struct {
 	Fields         []string      `json:"fields"`
 	Dimensions     []Dimension   `json:"dimensions"`
 	UpdateInterval time.Duration `json:"update_interval"`
+}
+
+type DimensionCount struct {
+	Name        string   `json:"name"`
+	OrderFields []string `json:"order_fields"`
+	Count       int64    `json:"count"`
 }
 
 type OrderField struct {
@@ -95,12 +101,6 @@ func encodeValues(fields []OrderField) (string, []OrderField, error) {
 		normalized[index] = OrderField{Name: field.Name, Value: text}
 	}
 	return encodeSequence(values), normalized, nil
-}
-
-func dimensionID(name, fields string) string {
-	identity, _ := json.Marshal([]string{name, fields})
-	digest := sha256.Sum256(identity)
-	return hex.EncodeToString(digest[:])
 }
 
 func recordID(name, dimension, value string, interval GroupInterval, bucket int64) string {

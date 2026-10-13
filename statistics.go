@@ -17,8 +17,9 @@ import (
 )
 
 const (
-	shardNum          = 8
-	minUpdateInterval = time.Minute
+	MaxDimensionFieldsBytes = 2048
+	shardNum                = 8
+	minUpdateInterval       = time.Minute
 )
 
 type Statistics[T any] struct {
@@ -163,6 +164,9 @@ func validateDefinition(name string, updateInterval time.Duration, fields []stat
 			seenFields[field] = true
 		}
 		identity := encodeSequence(dimension.OrderFields)
+		if len(identity) > MaxDimensionFieldsBytes {
+			return nil, nil, fmt.Errorf("dimension_fields contains %d bytes, exceeding the %d-byte limit", len(identity), MaxDimensionFieldsBytes)
+		}
 		if seenDimensions[identity] {
 			return nil, nil, fmt.Errorf("repeated dimension %q", identity)
 		}
@@ -184,7 +188,6 @@ func validateDefinition(name string, updateInterval time.Duration, fields []stat
 			GroupIntervals: intervals,
 			ClearAfter:     dimension.ClearAfter,
 			encodedFields:  identity,
-			id:             dimensionID(name, identity),
 		}
 	}
 	return append([]statisticField(nil), fields...), copied, nil
@@ -265,8 +268,7 @@ func (statistic *Statistics[T]) Add(values T, delta int64) error {
 			changes = append(changes, counterChange{
 				key: key, shardIndex: shardIndex,
 				row: counterRow{
-					name:        statistic.name,
-					dimensionID: dimension.id, dimension: dimension.encodedFields, value: encodedValues,
+					name: statistic.name, dimension: dimension.encodedFields, value: encodedValues,
 					interval: interval, bucket: bucket, updated: timestamp.Unix(), counter: delta,
 					clearAfter: dimension.ClearAfter,
 				},
@@ -373,7 +375,7 @@ func (statistic *statistics) get(ctx context.Context, orderFields []OrderField, 
 		if !exists {
 			continue
 		}
-		if row.name != statistic.name || row.dimensionID != matched.id || row.dimension != matched.encodedFields || row.value != encodedValues || row.interval != interval || row.bucket != bucket.time {
+		if row.name != statistic.name || row.dimension != matched.encodedFields || row.value != encodedValues || row.interval != interval || row.bucket != bucket.time {
 			return nil, errors.New("stored record identity does not match its key")
 		}
 		records = append(records, Record{

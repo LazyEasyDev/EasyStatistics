@@ -32,8 +32,7 @@ func schemaFor(dialect SQLDialect) ([]string, error) {
 			`CREATE TABLE IF NOT EXISTS "easy_statistics" (
 "record_id" VARCHAR(64) PRIMARY KEY,
 "name" TEXT NOT NULL,
-"dimension_id" VARCHAR(64) NOT NULL,
-"dimension_fields" TEXT NOT NULL,
+"dimension_fields" VARCHAR(2048) NOT NULL,
 "dimension_value" TEXT NOT NULL,
 "group_interval" VARCHAR(8) NOT NULL,
 "grouped_time" BIGINT NOT NULL,
@@ -48,8 +47,7 @@ func schemaFor(dialect SQLDialect) ([]string, error) {
 			"CREATE TABLE IF NOT EXISTS `easy_statistics` (" +
 				"`record_id` VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin PRIMARY KEY," +
 				"`name` VARCHAR(255) NOT NULL," +
-				"`dimension_id` VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL," +
-				"`dimension_fields` LONGTEXT NOT NULL," +
+				"`dimension_fields` VARCHAR(2048) CHARACTER SET ascii COLLATE ascii_bin NOT NULL," +
 				"`dimension_value` LONGTEXT NOT NULL," +
 				"`group_interval` VARCHAR(8) NOT NULL," +
 				"`grouped_time` BIGINT NOT NULL," +
@@ -64,7 +62,6 @@ func schemaFor(dialect SQLDialect) ([]string, error) {
 			`CREATE TABLE IF NOT EXISTS "easy_statistics" (
 "record_id" TEXT PRIMARY KEY,
 "name" TEXT NOT NULL,
-"dimension_id" TEXT NOT NULL,
 "dimension_fields" TEXT NOT NULL,
 "dimension_value" TEXT NOT NULL,
 "group_interval" TEXT NOT NULL,
@@ -79,8 +76,7 @@ func schemaFor(dialect SQLDialect) ([]string, error) {
 		return []string{
 			sqlServerCreate(tableName, `[record_id] VARCHAR(64) NOT NULL PRIMARY KEY,
 [name] NVARCHAR(255) NOT NULL,
-[dimension_id] VARCHAR(64) NOT NULL,
-[dimension_fields] NVARCHAR(MAX) NOT NULL,
+[dimension_fields] VARCHAR(2048) COLLATE Latin1_General_100_BIN2 NOT NULL,
 [dimension_value] NVARCHAR(MAX) NOT NULL,
 [group_interval] VARCHAR(8) NOT NULL,
 [grouped_time] BIGINT NOT NULL,
@@ -93,8 +89,7 @@ func schemaFor(dialect SQLDialect) ([]string, error) {
 		return []string{
 			oracleCreate(tableName, `"record_id" VARCHAR2(64) PRIMARY KEY,
 "name" VARCHAR2(255 CHAR) NOT NULL,
-"dimension_id" VARCHAR2(64) NOT NULL,
-"dimension_fields" CLOB NOT NULL,
+"dimension_fields" VARCHAR2(2048 BYTE) NOT NULL,
 "dimension_value" CLOB NOT NULL,
 "group_interval" VARCHAR2(8) NOT NULL,
 "grouped_time" NUMBER(19) NOT NULL,
@@ -182,7 +177,7 @@ func (dialect SQLDialect) insert(table string, names ...string) string {
 }
 
 func (dialect SQLDialect) selectRecords(count int) string {
-	columns := dialect.columns("record_id", "name", "dimension_id", "dimension_fields", "dimension_value", "group_interval", "grouped_time", "last_update_time", "counter")
+	columns := dialect.columns("record_id", "name", "dimension_fields", "dimension_value", "group_interval", "grouped_time", "last_update_time", "counter")
 	if dialect == SQLOracle {
 		// A driver may represent both SQL NULL and EMPTY_CLOB() as nil. Keep
 		// the actual SQL nullness available so corrupt nullable schemas fail.
@@ -193,6 +188,32 @@ func (dialect SQLDialect) selectRecords(count int) string {
 		parameters[index] = dialect.bindKey(index+1, 64)
 	}
 	return "SELECT " + columns + " FROM " + dialect.quote(tableName) + " WHERE " + dialect.quote("record_id") + " IN (" + strings.Join(parameters, ", ") + ")"
+}
+
+func (dialect SQLDialect) countRecords() string {
+	name := dialect.quote("name")
+	fields := dialect.quote("dimension_fields")
+	count := "COUNT(*)"
+	switch dialect {
+	case SQLPostgreSQL, SQLGaussDB:
+		name += ` COLLATE "C"`
+		fields += ` COLLATE "C"`
+	case SQLMySQL, SQLMariaDB, SQLTiDB:
+		name += " COLLATE utf8mb4_bin"
+		fields += " COLLATE ascii_bin"
+	case SQLSQLite:
+		name += " COLLATE BINARY"
+		fields += " COLLATE BINARY"
+	case SQLServer:
+		name += " COLLATE Latin1_General_100_BIN2"
+		fields += " COLLATE Latin1_General_100_BIN2"
+		count = "COUNT_BIG(*)"
+	case SQLOracle:
+		return "SELECT MIN(" + name + "), MIN(" + fields + "), " + count + " FROM " + dialect.quote(tableName) +
+			" GROUP BY UTL_RAW.CAST_TO_RAW(" + name + "), UTL_RAW.CAST_TO_RAW(SUBSTR(" + fields +
+			", 1, 1024)), UTL_RAW.CAST_TO_RAW(SUBSTR(" + fields + ", 1025, 1024))"
+	}
+	return "SELECT " + name + ", " + fields + ", " + count + " FROM " + dialect.quote(tableName) + " GROUP BY " + name + ", " + fields
 }
 
 func (dialect SQLDialect) countBatches() string {
@@ -285,7 +306,7 @@ AND indexes.STATUS = 'VALID' AND indexes.INDEX_TYPE = 'NORMAL'`
 }
 
 func (dialect SQLDialect) insertRecord() string {
-	names := []string{"record_id", "name", "dimension_id", "dimension_fields", "dimension_value", "group_interval", "grouped_time", "last_update_time", "expire_time", "counter"}
+	names := []string{"record_id", "name", "dimension_fields", "dimension_value", "group_interval", "grouped_time", "last_update_time", "expire_time", "counter"}
 	return dialect.insert(tableName, names...)
 }
 
@@ -294,17 +315,17 @@ func (dialect SQLDialect) upsertRecord() (string, error) {
 	updated := dialect.quote("last_update_time")
 	switch dialect {
 	case SQLMySQL, SQLMariaDB, SQLTiDB:
-		updates := dialect.upsertAssignments(counter, "VALUES("+counter+")", updated, "VALUES("+updated+")", dialect.bind(11))
+		updates := dialect.upsertAssignments(counter, "VALUES("+counter+")", updated, "VALUES("+updated+")", dialect.bind(10))
 		return dialect.insertRecord() + " ON DUPLICATE KEY UPDATE " + updates, nil
 	case SQLGaussDB:
-		updates := dialect.upsertAssignments(counter, "EXCLUDED."+counter, updated, "EXCLUDED."+updated, dialect.bind(11))
+		updates := dialect.upsertAssignments(counter, "EXCLUDED."+counter, updated, "EXCLUDED."+updated, dialect.bind(10))
 		return dialect.insertRecord() + " ON DUPLICATE KEY UPDATE " + updates, nil
 	case SQLPostgreSQL, SQLSQLite:
 		table := dialect.quote(tableName) + "."
-		updates := dialect.upsertAssignments(table+counter, "excluded."+counter, table+updated, "excluded."+updated, dialect.bind(11))
+		updates := dialect.upsertAssignments(table+counter, "excluded."+counter, table+updated, "excluded."+updated, dialect.bind(10))
 		return dialect.insertRecord() + " ON CONFLICT (" + dialect.quote("record_id") + ") DO UPDATE SET " + updates, nil
 	case SQLServer, SQLOracle:
-		names := []string{"record_id", "name", "dimension_id", "dimension_fields", "dimension_value", "group_interval", "grouped_time", "last_update_time", "expire_time", "counter"}
+		names := []string{"record_id", "name", "dimension_fields", "dimension_value", "group_interval", "grouped_time", "last_update_time", "expire_time", "counter"}
 		sources := make([]string, len(names)+1)
 		values := make([]string, len(names))
 		for index, name := range names {
@@ -312,13 +333,13 @@ func (dialect SQLDialect) upsertRecord() (string, error) {
 			if name == "record_id" {
 				parameter = dialect.bindKey(index+1, 64)
 			}
-			if dialect == SQLOracle && (name == "dimension_fields" || name == "dimension_value") {
+			if dialect == SQLOracle && name == "dimension_value" {
 				parameter = "NVL(TO_CLOB(" + parameter + "), EMPTY_CLOB())"
 			}
 			sources[index] = parameter + " AS " + dialect.quote(name)
 			values[index] = "incoming." + dialect.quote(name)
 		}
-		sources[len(names)] = dialect.bind(11) + " AS " + dialect.quote("clear_after")
+		sources[len(names)] = dialect.bind(10) + " AS " + dialect.quote("clear_after")
 		source := "SELECT " + strings.Join(sources, ", ")
 		table := dialect.quote(tableName)
 		if dialect == SQLOracle {
@@ -340,14 +361,14 @@ func (dialect SQLDialect) upsertRecord() (string, error) {
 	}
 }
 
-func (dialect SQLDialect) startOracleClob(column string) string {
-	quoted := dialect.quote(column)
+func (dialect SQLDialect) startOracleClob() string {
+	quoted := dialect.quote("dimension_value")
 	return "UPDATE " + dialect.quote(tableName) + " SET " + quoted + " = TO_CLOB(:1) WHERE " +
 		dialect.quote("record_id") + " = :2 AND DBMS_LOB.COMPARE(" + quoted + ", TO_CLOB(:3)) = 0"
 }
 
-func (dialect SQLDialect) appendOracleClob(column string) string {
-	quoted := dialect.quote(column)
+func (dialect SQLDialect) appendOracleClob() string {
+	quoted := dialect.quote("dimension_value")
 	return "UPDATE " + dialect.quote(tableName) + " SET " + quoted + " = " + quoted + " || TO_CLOB(:1) WHERE " +
 		dialect.quote("record_id") + " = :2 AND DBMS_LOB.GETLENGTH(" + quoted + ") = :3"
 }
@@ -375,7 +396,7 @@ func counterAddition(counter, delta string) string {
 
 func (dialect SQLDialect) schemaQuery(index int) string {
 	table := tableName
-	names := []string{"record_id", "name", "dimension_id", "dimension_fields", "dimension_value", "group_interval", "grouped_time", "last_update_time", "expire_time", "counter"}
+	names := []string{"record_id", "name", "dimension_fields", "dimension_value", "group_interval", "grouped_time", "last_update_time", "expire_time", "counter"}
 	if index == 1 {
 		table = batchTableName
 		names = []string{"batch_id", "created_unix_time"}

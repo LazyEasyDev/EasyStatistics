@@ -138,6 +138,8 @@ Names are **case-sensitive**: `Xx` and `xx` are valid, distinct names; `1X` is i
 
 Participating tag names must not contain duplicates. Each `Dimension.OrderFields` must be a nonempty ordered subset of these names, without duplicates. **Every item must match a participating tag exactly, including case.** Referencing an ignored field, the Go field name instead of its tag, or a different capitalization causes `NewStatistics[T]` to return an error. A field may be reused in different dimensions.
 
+The complete encoded field list has a **2,048-byte limit** (`MaxDimensionFieldsBytes`), including the `:` separators. Valid tags are ASCII and do not need escaping, so bytes and characters are equal here. Exactly 2,048 bytes is accepted; a longer dimension returns an error at creation with the actual length and limit. Field lists are never truncated. This limit does not restrict dimension values or change the individual tag or statistic-name limits.
+
 Struct declaration order and keyed struct-literal order do not determine stored keys; `Dimension.OrderFields` does. For example, `{"user", "activity"}` and `{"activity", "user"}` identify different dimensions. Query headers (`OrderField.Name`) must match a configured dimension exactly, including case and order. Dimension and query names remain runtime-validated strings. When retaining existing counters or renaming a Go field, keep its tag name and dimension order unchanged: changing them changes persisted dimension and record keys.
 
 The quick start updates three counters for each addition:
@@ -195,7 +197,7 @@ This returns the same typed instance created by `NewStatistics`. Use the same va
 ### List Registered Statistics
 
 ```go
-registered, err := EasyStatistics.ListStatistics()
+registered, err := EasyStatistics.ListStatistics(false)
 if err != nil {
 	return err
 }
@@ -204,9 +206,27 @@ for _, definition := range registered {
 }
 ```
 
-`ListStatistics() ([]StatisticsDefinition, error)` returns every statistic registered in the current process, ordered by name. Definitions include participating field names, configured dimensions, and the update interval. Listing does not read SQL, discover database-only names, count persisted records, or create workers. Use `GetStatistics[T]` to retrieve a typed handle, or `QueryStatistics(name)` to obtain a fresh query builder without knowing its Go values type. An unknown name wraps `ErrStatisticsNotFound`.
+`ListStatistics(withDBCounter bool) ([]StatisticsDefinition, error)` returns every statistic registered in the current process, ordered by name. Definitions include participating field names, configured dimensions, and the update interval. `false` keeps listing SQL-free, leaving each dimension's `Count` at zero without measuring the database. `true` queries persisted row counts once and attaches them to the exact matching name and ordered fields; a successful query with no matching group produces zero. Count merging belongs to the library, not the application.
+
+Counted listing uses a background context with the library's 60-second SQL timeout and returns an error with no partial definitions if counting fails. It does not discover database-only statistics or create workers. Use `DBCount(ctx)` for all stored groups with an explicit caller context, `GetStatistics[T]` to retrieve a typed handle, or `QueryStatistics(name)` to obtain a fresh query builder without knowing its Go values type. An unknown name wraps `ErrStatisticsNotFound`.
 
 The returned definitions are independent snapshots, including their nested slices. Later registrations do not update an existing snapshot. An initialized service with no registrations returns a non-nil empty slice. An uninitialized, closing, or closed service returns an error. Definition and record types use snake_case JSON tags; definition durations retain Go's nanosecond representation.
+
+### Count Stored Rows
+
+```go
+counts, err := EasyStatistics.DBCount(ctx)
+if err != nil {
+	return err
+}
+for _, counted := range counts {
+	fmt.Println(counted.Name, counted.OrderFields, counted.Count)
+}
+```
+
+`DBCount(ctx) ([]DimensionCount, error)` groups all persisted `easy_statistics` rows by the exact statistic name and ordered field list, including statistics not registered in the current process. Keys are case-sensitive and preserve Unicode spelling and field order. Each `int64` count includes every stored value, interval, and bucket in that dimension; it is **not** a sum of counters, a distinct-value count, or a count of buffered additions. Zero and negative counters still count as rows. Expired rows remain included until cleanup physically deletes them.
+
+Results are ordered by name and encoded fields. An empty table returns a non-nil empty slice, and groups without stored rows are absent. Initialization, shutdown, cancellation, invalid stored metadata, and database errors return an error with no partial counts. The caller's context has a 60-second maximum SQL timeout. The query scans stored rows; no grouping index or precomputed counts are maintained.
 
 `CountBatches(ctx) (int64, error)` returns the global number of rows currently stored in `easy_statistics_batches`. These are retained upload-deduplication markers, not lifetime uploads, pending buffers, or per-statistic counts. An empty table returns zero. Initialization, shutdown, cancellation, and database errors are reported rather than presented as a zero count. The operation uses the caller's context with a 60-second maximum timeout.
 
@@ -338,7 +358,9 @@ Pass the dialect matching your database to `Init` and import its driver in your 
 
 Schema setup retains its **60-second SQL timeout**. Creating an index on a large existing table can take longer or block concurrent work; precreate a suitable nonunique expiry index during planned database maintenance before upgrading. Initialization returns an error if the index cannot be created or verified; it does not drop conflicting or invalid indexes automatically.
 
-The counter table requires the `expire_time` column. Existing tables created without it must be updated separately before initialization. Apart from ensuring the expiry index, the library does not migrate existing columns or fully validate their types and constraints.
+The counter table has no `dimension_id` column; record IDs retain their original identity format. `dimension_fields` uses `VARCHAR(2048)` on PostgreSQL/GaussDB, ASCII `VARCHAR(2048)` on the MySQL family, binary-collated `VARCHAR(2048)` on SQL Server, `VARCHAR2(2048 BYTE)` on Oracle, and `TEXT` with Go-side validation on SQLite. Dimension values retain their large-text storage. Oracle groups the full field list using two binary segments, avoiding both CLOB grouping and truncated sort keys under standard string limits.
+
+Stop writers and explicitly migrate or recreate old statistics tables before using this schema. The counter table also requires `expire_time`. Apart from ensuring the expiry index, `Init` does not migrate existing columns, remove obsolete columns, truncate data, or drop tables, and does not fully validate column types and constraints.
 
 The Oracle insert explicitly stores an empty dimension value as a non-null empty CLOB rather than SQL NULL.
 
@@ -356,8 +378,9 @@ SQL Server 2022 CU27 (16.0.4295.3) with `go-mssqldb` 1.11.2 was also exercised a
 Init(database *sql.DB, dialect SQLDialect) error
 NewStatistics[T any](name string, updateInterval time.Duration, dimensions []Dimension) (*Statistics[T], error)
 GetStatistics[T any](name string) (*Statistics[T], error)
-ListStatistics() ([]StatisticsDefinition, error)
+ListStatistics(withDBCounter bool) ([]StatisticsDefinition, error)
 QueryStatistics(name string) (*Query, error)
+DBCount(ctx context.Context) ([]DimensionCount, error)
 CountBatches(ctx context.Context) (int64, error)
 Close() error
 
@@ -372,6 +395,7 @@ Close() error
 (*Query).Get() ([]Record, error)
 
 MaxQueryBuckets = 500
+MaxDimensionFieldsBytes = 2048
 ErrInvalidQuery
 ErrStatisticsNotFound
 ```

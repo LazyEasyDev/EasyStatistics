@@ -9,6 +9,7 @@ import (
 	"math/big"
 	mathrand "math/rand"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -184,7 +185,7 @@ func lookupStatistics(name string) (registeredStatistic, error) {
 	return registered, nil
 }
 
-func ListStatistics() ([]StatisticsDefinition, error) {
+func ListStatistics(withDBCounter bool) ([]StatisticsDefinition, error) {
 	initialized, err := currentService()
 	if err != nil {
 		return nil, err
@@ -199,8 +200,45 @@ func ListStatistics() ([]StatisticsDefinition, error) {
 		registered = append(registered, statistic.definition())
 	}
 	initialized.mu.Unlock()
+	if withDBCounter {
+		counts, err := initialized.backend.count(context.Background())
+		if err != nil {
+			return nil, err
+		}
+		type dimensionKey struct {
+			name   string
+			fields string
+		}
+		stored := make(map[dimensionKey]int64, len(counts))
+		for _, counted := range counts {
+			stored[dimensionKey{name: counted.Name, fields: strings.Join(counted.OrderFields, ":")}] = counted.Count
+		}
+		for _, definition := range registered {
+			for index := range definition.Dimensions {
+				dimension := &definition.Dimensions[index]
+				dimension.Count = stored[dimensionKey{name: definition.Name, fields: strings.Join(dimension.OrderFields, ":")}]
+			}
+		}
+	}
 	sort.Slice(registered, func(left, right int) bool { return registered[left].Name < registered[right].Name })
 	return registered, nil
+}
+
+func DBCount(ctx context.Context) ([]DimensionCount, error) {
+	if ctx == nil {
+		return nil, errors.New("context is required")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	initialized, err := currentService()
+	if err != nil {
+		return nil, err
+	}
+	if initialized.isClosing() {
+		return nil, errors.New("EasyStatistics is closed")
+	}
+	return initialized.backend.count(ctx)
 }
 
 func CountBatches(ctx context.Context) (int64, error) {

@@ -24,16 +24,15 @@ const (
 )
 
 type counterRow struct {
-	id          string
-	name        string
-	dimensionID string
-	dimension   string
-	value       string
-	interval    GroupInterval
-	bucket      int64
-	updated     int64
-	counter     int64
-	clearAfter  time.Duration
+	id         string
+	name       string
+	dimension  string
+	value      string
+	interval   GroupInterval
+	bucket     int64
+	updated    int64
+	counter    int64
+	clearAfter time.Duration
 }
 
 type uploadBatch struct {
@@ -171,7 +170,7 @@ func (backend *sqlBackend) getRows(ctx context.Context, identities []string) (ma
 		var value sql.NullString
 		var valueIsNull int
 		targets := []any{
-			&row.id, &row.name, &row.dimensionID, &row.dimension, &value, &row.interval, &row.bucket, &row.updated, &row.counter,
+			&row.id, &row.name, &row.dimension, &value, &row.interval, &row.bucket, &row.updated, &row.counter,
 		}
 		if backend.dialect == SQLOracle {
 			targets = append(targets, &valueIsNull)
@@ -198,6 +197,47 @@ func (backend *sqlBackend) getRows(ctx context.Context, identities []string) (ma
 		return nil, err
 	}
 	return result, nil
+}
+
+func (backend *sqlBackend) count(ctx context.Context) ([]DimensionCount, error) {
+	ctx, cancel := context.WithTimeout(ctx, sqlTimeout)
+	defer cancel()
+	rows, err := backend.db.QueryContext(ctx, backend.dialect.countRecords())
+	if err != nil {
+		return nil, fmt.Errorf("count stored statistics records: %w", err)
+	}
+	defer rows.Close()
+	counts := make([]DimensionCount, 0)
+	for rows.Next() {
+		var counted DimensionCount
+		var encodedFields string
+		if err := rows.Scan(&counted.Name, &encodedFields, &counted.Count); err != nil {
+			return nil, fmt.Errorf("read statistics count: %w", err)
+		}
+		if err := validateIdentifier(counted.Name); err != nil {
+			return nil, fmt.Errorf("stored statistics name: %w", err)
+		}
+		if len(encodedFields) > MaxDimensionFieldsBytes {
+			return nil, errors.New("stored dimension_fields exceeds its byte limit")
+		}
+		counted.OrderFields = strings.Split(encodedFields, ":")
+		for _, field := range counted.OrderFields {
+			if !validStatName(field) {
+				return nil, fmt.Errorf("stored dimension field %q is invalid", field)
+			}
+		}
+		counts = append(counts, counted)
+	}
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+		return nil, fmt.Errorf("read statistics counts: %w", err)
+	}
+	sort.Slice(counts, func(left, right int) bool {
+		if counts[left].Name != counts[right].Name {
+			return counts[left].Name < counts[right].Name
+		}
+		return strings.Join(counts[left].OrderFields, ":") < strings.Join(counts[right].OrderFields, ":")
+	})
+	return counts, nil
 }
 
 func (backend *sqlBackend) countBatches(ctx context.Context) (int64, error) {
@@ -247,22 +287,17 @@ func (backend *sqlBackend) applyBatch(ctx context.Context, batch *miniBatch) err
 		marker = "!" + batch.id
 	}
 	for _, incoming := range batch.rows {
-		dimension, value := incoming.dimension, incoming.value
-		if backend.dialect == SQLOracle {
-			if len(dimension) > oracleTextChunkSize {
-				dimension = marker
-			}
-			if len(value) > oracleTextChunkSize {
-				value = marker
-			}
+		value := incoming.value
+		if backend.dialect == SQLOracle && len(value) > oracleTextChunkSize {
+			value = marker
 		}
-		_, err := transaction.ExecContext(ctx, statement, incoming.id, incoming.name, incoming.dimensionID, dimension, value,
+		_, err := transaction.ExecContext(ctx, statement, incoming.id, incoming.name, incoming.dimension, value,
 			string(incoming.interval), incoming.bucket, incoming.updated, expireTime(incoming.updated, incoming.clearAfter), incoming.counter, expireTime(0, incoming.clearAfter))
 		if err != nil {
 			return fmt.Errorf("upsert statistics record: %w", err)
 		}
 		if backend.dialect == SQLOracle {
-			if err := backend.completeOracleClobs(ctx, transaction, incoming, marker); err != nil {
+			if err := backend.completeOracleClob(ctx, transaction, incoming, marker); err != nil {
 				return err
 			}
 		}
@@ -273,47 +308,40 @@ func (backend *sqlBackend) applyBatch(ctx context.Context, batch *miniBatch) err
 	return nil
 }
 
-func (backend *sqlBackend) completeOracleClobs(ctx context.Context, transaction *sql.Tx, row counterRow, marker string) error {
-	for _, field := range []struct{ name, text string }{
-		{"dimension_fields", row.dimension}, {"dimension_value", row.value},
-	} {
-		if len(field.text) <= oracleTextChunkSize {
-			continue
+func (backend *sqlBackend) completeOracleClob(ctx context.Context, transaction *sql.Tx, row counterRow, marker string) error {
+	if len(row.value) <= oracleTextChunkSize {
+		return nil
+	}
+	result, err := transaction.ExecContext(ctx, backend.dialect.startOracleClob(), row.value[:oracleTextChunkSize], row.id, marker)
+	if err != nil {
+		return fmt.Errorf("start statistics dimension_value CLOB: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("count statistics dimension_value CLOB start: %w", err)
+	}
+	if affected == 0 {
+		return nil
+	}
+	if affected != 1 {
+		return fmt.Errorf("start statistics dimension_value CLOB affected %d rows, expected one", affected)
+	}
+	statement := backend.dialect.appendOracleClob()
+	for offset := oracleTextChunkSize; offset < len(row.value); offset += oracleTextChunkSize {
+		end := offset + oracleTextChunkSize
+		if end > len(row.value) {
+			end = len(row.value)
 		}
-		// The random mini-batch marker begins with '!', which cannot occur in
-		// URL-escaped dimension metadata. Only this transaction's newly inserted
-		// row gets the marker; matched metadata stays untouched, even if corrupt.
-		result, err := transaction.ExecContext(ctx, backend.dialect.startOracleClob(field.name), field.text[:oracleTextChunkSize], row.id, marker)
+		result, err := transaction.ExecContext(ctx, statement, row.value[offset:end], row.id, int64(offset))
 		if err != nil {
-			return fmt.Errorf("start statistics %s CLOB: %w", field.name, err)
+			return fmt.Errorf("complete statistics dimension_value CLOB: %w", err)
 		}
 		affected, err := result.RowsAffected()
 		if err != nil {
-			return fmt.Errorf("count statistics %s CLOB start: %w", field.name, err)
-		}
-		if affected == 0 {
-			continue
+			return fmt.Errorf("count statistics dimension_value CLOB update: %w", err)
 		}
 		if affected != 1 {
-			return fmt.Errorf("start statistics %s CLOB affected %d rows, expected one", field.name, affected)
-		}
-		statement := backend.dialect.appendOracleClob(field.name)
-		for offset := oracleTextChunkSize; offset < len(field.text); offset += oracleTextChunkSize {
-			end := offset + oracleTextChunkSize
-			if end > len(field.text) {
-				end = len(field.text)
-			}
-			result, err := transaction.ExecContext(ctx, statement, field.text[offset:end], row.id, int64(offset))
-			if err != nil {
-				return fmt.Errorf("complete statistics %s CLOB: %w", field.name, err)
-			}
-			affected, err := result.RowsAffected()
-			if err != nil {
-				return fmt.Errorf("count statistics %s CLOB update: %w", field.name, err)
-			}
-			if affected != 1 {
-				return fmt.Errorf("complete statistics %s CLOB affected %d rows, expected one", field.name, affected)
-			}
+			return fmt.Errorf("complete statistics dimension_value CLOB affected %d rows, expected one", affected)
 		}
 	}
 	return nil
