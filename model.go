@@ -24,25 +24,32 @@ const (
 )
 
 type Dimension struct {
-	OrderFields    []string
-	GroupIntervals []GroupInterval
-	ClearAfter     time.Duration
+	OrderFields    []string        `json:"order_fields"`
+	GroupIntervals []GroupInterval `json:"group_intervals"`
+	ClearAfter     time.Duration   `json:"clear_after"`
 	encodedFields  string
 	id             string
 }
 
+type StatisticsDefinition struct {
+	Name           string        `json:"name"`
+	Fields         []string      `json:"fields"`
+	Dimensions     []Dimension   `json:"dimensions"`
+	UpdateInterval time.Duration `json:"update_interval"`
+}
+
 type OrderField struct {
-	Name  string
-	Value any
+	Name  string `json:"name"`
+	Value any    `json:"value"`
 }
 
 type Record struct {
-	Name           string
-	OrderFields    []OrderField
-	GroupInterval  GroupInterval
-	GroupedTimeStr string
-	LastUpdateTime time.Time
-	Counter        int64
+	Name           string        `json:"name"`
+	OrderFields    []OrderField  `json:"order_fields"`
+	GroupInterval  GroupInterval `json:"group_interval"`
+	GroupedTimeStr string        `json:"grouped_time"`
+	LastUpdateTime time.Time     `json:"last_update_time"`
+	Counter        int64         `json:"counter"`
 }
 
 func normalizeValue(value any) (string, error) {

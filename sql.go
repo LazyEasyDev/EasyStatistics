@@ -151,31 +151,63 @@ func waitDelay(ctx context.Context, delay time.Duration) error {
 	}
 }
 
-func (backend *sqlBackend) getRow(identity string) (counterRow, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), sqlTimeout)
+func (backend *sqlBackend) getRows(ctx context.Context, identities []string) (map[string]counterRow, error) {
+	ctx, cancel := context.WithTimeout(ctx, sqlTimeout)
 	defer cancel()
-	row := counterRow{id: identity}
-	var value sql.NullString
-	var valueIsNull int
-	targets := []any{
-		&row.name, &row.dimensionID, &row.dimension, &value, &row.interval, &row.bucket, &row.updated, &row.counter,
+	parameters := make([]any, len(identities))
+	requested := make(map[string]bool, len(identities))
+	for index, identity := range identities {
+		parameters[index] = identity
+		requested[identity] = true
 	}
-	if backend.dialect == SQLOracle {
-		targets = append(targets, &valueIsNull)
+	rows, err := backend.db.QueryContext(ctx, backend.dialect.selectRecords(len(identities)), parameters...)
+	if err != nil {
+		return nil, err
 	}
-	err := backend.db.QueryRowContext(ctx, backend.dialect.selectRecord(), identity).Scan(targets...)
-	if err == nil {
-		// Some Oracle drivers return a nil value for a non-null EMPTY_CLOB().
-		// Empty dimension values are valid; other dialects must not accept NULL.
+	defer rows.Close()
+	result := make(map[string]counterRow, len(identities))
+	for rows.Next() {
+		var row counterRow
+		var value sql.NullString
+		var valueIsNull int
+		targets := []any{
+			&row.id, &row.name, &row.dimensionID, &row.dimension, &value, &row.interval, &row.bucket, &row.updated, &row.counter,
+		}
+		if backend.dialect == SQLOracle {
+			targets = append(targets, &valueIsNull)
+		}
+		if err := rows.Scan(targets...); err != nil {
+			return nil, err
+		}
 		if valueIsNull != 0 || (!value.Valid && backend.dialect != SQLOracle) {
-			return row, errors.New("stored dimension value is NULL")
+			return nil, errors.New("stored dimension value is NULL")
+		}
+		if !requested[row.id] {
+			return nil, errors.New("stored record was not requested")
+		}
+		if _, exists := result[row.id]; exists {
+			return nil, errors.New("stored record ID is duplicated")
 		}
 		row.value = value.String
 		if backend.dialect == SQLGaussDB && row.value == gaussEmptyValue {
 			row.value = ""
 		}
+		result[row.id] = row
 	}
-	return row, err
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func (backend *sqlBackend) countBatches(ctx context.Context) (int64, error) {
+	ctx, cancel := context.WithTimeout(ctx, sqlTimeout)
+	defer cancel()
+	var count int64
+	if err := backend.db.QueryRowContext(ctx, backend.dialect.countBatches()).Scan(&count); err != nil {
+		return 0, fmt.Errorf("count stored statistics batches: %w", err)
+	}
+	return count, nil
 }
 
 func expireTime(updated int64, clearAfter time.Duration) int64 {

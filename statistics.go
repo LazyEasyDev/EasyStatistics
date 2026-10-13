@@ -1,7 +1,7 @@
 package EasyStatistics
 
 import (
-	"database/sql"
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -301,11 +301,28 @@ func (statistic *Statistics[T]) Add(values T, delta int64) error {
 	return nil
 }
 
-func (statistic *statistics) Query() *Query {
-	return &Query{statistic: statistic}
+func (statistic *statistics) definition() StatisticsDefinition {
+	definition := StatisticsDefinition{
+		Name: statistic.name, UpdateInterval: statistic.updateInterval,
+		Fields: make([]string, len(statistic.fields)), Dimensions: make([]Dimension, len(statistic.dimensions)),
+	}
+	for index, field := range statistic.fields {
+		definition.Fields[index] = field.name
+	}
+	for index, dimension := range statistic.dimensions {
+		definition.Dimensions[index] = Dimension{
+			OrderFields:    append([]string(nil), dimension.OrderFields...),
+			GroupIntervals: append([]GroupInterval(nil), dimension.GroupIntervals...), ClearAfter: dimension.ClearAfter,
+		}
+	}
+	return definition
 }
 
-func (statistic *statistics) get(orderFields []OrderField, interval GroupInterval, bucket int64, label string) (*Record, error) {
+func (statistic *statistics) Query() *Query {
+	return &Query{statistic: statistic, ctx: context.Background()}
+}
+
+func (statistic *statistics) get(ctx context.Context, orderFields []OrderField, interval GroupInterval, buckets []queryBucket) ([]Record, error) {
 	initialized := statistic.service
 	if initialized.isClosing() {
 		return nil, errors.New("EasyStatistics is closed")
@@ -336,27 +353,35 @@ func (statistic *statistics) get(orderFields []OrderField, interval GroupInterva
 		}
 	}
 	if matched == nil {
-		return nil, errors.New("query fields and interval must match a configured dimension in order")
+		return nil, fmt.Errorf("%w: query fields and interval must match a configured dimension in order", ErrInvalidQuery)
 	}
 	encodedValues, normalized, err := encodeValues(orderFields)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: %v", ErrInvalidQuery, err)
 	}
-	identity := recordID(statistic.name, matched.encodedFields, encodedValues, interval, bucket)
-	row, err := initialized.backend.getRow(identity)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, nil
+	identities := make([]string, len(buckets))
+	for index, bucket := range buckets {
+		identities[index] = recordID(statistic.name, matched.encodedFields, encodedValues, interval, bucket.time)
 	}
+	rows, err := initialized.backend.getRows(ctx, identities)
 	if err != nil {
 		return nil, fmt.Errorf("query statistics: %w", err)
 	}
-	if row.name != statistic.name || row.dimensionID != matched.id || row.dimension != matched.encodedFields || row.value != encodedValues || row.interval != interval || row.bucket != bucket {
-		return nil, errors.New("stored record identity does not match its key")
+	records := make([]Record, 0, len(rows))
+	for index, bucket := range buckets {
+		row, exists := rows[identities[index]]
+		if !exists {
+			continue
+		}
+		if row.name != statistic.name || row.dimensionID != matched.id || row.dimension != matched.encodedFields || row.value != encodedValues || row.interval != interval || row.bucket != bucket.time {
+			return nil, errors.New("stored record identity does not match its key")
+		}
+		records = append(records, Record{
+			Name: row.name, OrderFields: append([]OrderField(nil), normalized...), GroupInterval: interval, GroupedTimeStr: bucket.label,
+			LastUpdateTime: time.Unix(row.updated, 0).UTC(), Counter: row.counter,
+		})
 	}
-	return &Record{
-		Name: row.name, OrderFields: normalized, GroupInterval: interval, GroupedTimeStr: label,
-		LastUpdateTime: time.Unix(row.updated, 0).UTC(), Counter: row.counter,
-	}, nil
+	return records, nil
 }
 
 func bucketFor(interval GroupInterval, timestamp time.Time) (int64, string, error) {

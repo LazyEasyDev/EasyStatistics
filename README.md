@@ -88,17 +88,17 @@ func run() error {
 		return err
 	}
 
-	record, err := score.Query().
+	records, err := score.Query().
 		Field("user", "alice").
 		GroupInterval(EasyStatistics.GroupForever).
 		Get()
 	if err != nil {
 		return err
 	}
-	if record == nil {
+	if len(records) == 0 {
 		fmt.Println("No uploaded total yet.")
 	} else {
-		fmt.Println(record.Counter, record.LastUpdateTime)
+		fmt.Println(records[0].Counter, records[0].LastUpdateTime)
 	}
 	return nil
 }
@@ -199,21 +199,23 @@ registered, err := EasyStatistics.ListStatistics()
 if err != nil {
 	return err
 }
-for name, handle := range registered {
-	fmt.Printf("%s: %T\n", name, handle)
+for _, definition := range registered {
+	fmt.Println(definition.Name, definition.Dimensions, definition.UpdateInterval)
 }
 ```
 
-`ListStatistics() (map[string]any, error)` returns every statistic registered in the current service, keyed by name. Each value is the original `*Statistics[T]` handle, so different values types can appear in the same map. Use a type assertion such as `registered["mining_score"].(*EasyStatistics.Statistics[MiningValues])`, or use a listed name with `GetStatistics[T]`, to access a typed handle. Listing does not read SQL or create workers.
+`ListStatistics() ([]StatisticsDefinition, error)` returns every statistic registered in the current process, ordered by name. Definitions include participating field names, configured dimensions, and the update interval. Listing does not read SQL, discover database-only names, count persisted records, or create workers. Use `GetStatistics[T]` to retrieve a typed handle, or `QueryStatistics(name)` to obtain a fresh query builder without knowing its Go values type. An unknown name wraps `ErrStatisticsNotFound`.
 
-The returned map is an independent snapshot: adding, deleting, or replacing its entries does not change registrations, and later registrations do not update an existing snapshot. An initialized service with no registrations returns a non-nil empty map. An uninitialized, closing, or closed service returns an error. Map iteration order is unspecified.
+The returned definitions are independent snapshots, including their nested slices. Later registrations do not update an existing snapshot. An initialized service with no registrations returns a non-nil empty slice. An uninitialized, closing, or closed service returns an error. Definition and record types use snake_case JSON tags; definition durations retain Go's nanosecond representation.
+
+`CountBatches(ctx) (int64, error)` returns the global number of rows currently stored in `easy_statistics_batches`. These are retained upload-deduplication markers, not lifetime uploads, pending buffers, or per-statistic counts. An empty table returns zero. Initialization, shutdown, cancellation, and database errors are reported rather than presented as a zero count. The operation uses the caller's context with a 60-second maximum timeout.
 
 ### Query Counters
 
 Choose exactly one configured dimension, preserve its field order, and use one of its configured intervals:
 
 ```go
-record, err := score.Query().
+records, err := score.Query().
 	Field("user", "alice").
 	Field("activity", "mining").
 	GroupInterval(EasyStatistics.GroupMonth).
@@ -222,12 +224,12 @@ record, err := score.Query().
 if err != nil {
 	return err
 }
-if record != nil {
+for _, record := range records {
 	fmt.Println(record.Counter)
 }
 ```
 
-Each `Query()` returns a fresh mutable builder. `Field(name, value)` appends a field in call order, using its `stat` tag name. `GroupInterval` and `GroupTime` replace their previous selections. Validation and SQL execution happen only when you call `Get()`. The builder can be reused, but do not modify it concurrently; use separate builders for independently configured queries.
+Each `Query()` returns a fresh mutable builder. `Field(name, value)` appends a field in call order, using its `stat` tag name. `GroupInterval` replaces the previous interval. `GroupTime` selects one bucket and clears a previous range; `GroupTimeRange(start, end)` replaces the selection with an inclusive range. Validation and SQL execution happen only when you call `Get()`. The builder can be reused, but do not modify it concurrently; use separate builders for independently configured queries.
 
 `GroupInterval` is required. `GroupTime` is required for day, week, month, and year queries, but **optional for `GroupForever`**. It accepts these input types:
 
@@ -239,9 +241,25 @@ Each `Query()` returns a fresh mutable builder. `Field(name, value)` appends a f
 
 Unsupported time types return an error from `Get()`, including when explicitly supplied for `GroupForever`.
 
-All queries read **uploaded SQL data only**. A missing row returns `(nil, nil)`; a stored zero counter returns a non-nil record. Invalid input or a database failure returns an error.
+`Get() ([]Record, error)` is used for both single buckets and ranges. All queries read **uploaded SQL data only**. A missing bucket is skipped, and no matching rows return a non-nil empty slice. A stored zero counter remains a record. Results are chronological. Invalid query input wraps `ErrInvalidQuery`; database errors return no partial records.
 
 `Record` includes the statistic name, normalized field values, interval, bucket string, counter, and `LastUpdateTime`. That timestamp is the latest persisted local `Add` time, not the upload time.
+
+For a range, supply exact values for one configured dimension and the same time input types supported by `GroupTime`:
+
+```go
+records, err := score.Query().
+	Field("user", "alice").
+	Field("activity", "mining").
+	GroupInterval(EasyStatistics.GroupMonth).
+	GroupTimeRange("2026-01", "2026-10").
+	WithContext(ctx).
+	Get()
+```
+
+The end must not precede the start, even when both fall in the same bucket. Endpoints are normalized using the selected UTC interval; both endpoint buckets are included. October 1 through October 3 with `GroupDay` requests three buckets. Months and years use calendar arithmetic, and weeks follow ISO rules. `MaxQueryBuckets` is **500**: exactly 500 requested buckets are allowed, while 501 or more return an error before any SQL. The limit counts requested buckets, including those missing in storage. `GroupForever` rejects ranges.
+
+The library calculates each bucket's record ID and reads those primary keys with a bounded `IN` query, without scanning names or requiring another index. `WithContext(ctx)` propagates request cancellation with a maximum SQL timeout of 60 seconds; without it, queries use a background context. A nil context is rejected.
 
 ### Choose Time Buckets
 
@@ -338,6 +356,9 @@ SQL Server 2022 CU27 (16.0.4295.3) with `go-mssqldb` 1.11.2 was also exercised a
 Init(database *sql.DB, dialect SQLDialect) error
 NewStatistics[T any](name string, updateInterval time.Duration, dimensions []Dimension) (*Statistics[T], error)
 GetStatistics[T any](name string) (*Statistics[T], error)
+ListStatistics() ([]StatisticsDefinition, error)
+QueryStatistics(name string) (*Query, error)
+CountBatches(ctx context.Context) (int64, error)
 Close() error
 
 (*Statistics[T]).Add(values T, delta int64) error
@@ -346,7 +367,13 @@ Close() error
 (*Query).Field(name string, value any) *Query
 (*Query).GroupInterval(interval GroupInterval) *Query
 (*Query).GroupTime(value any) *Query
-(*Query).Get() (*Record, error)
+(*Query).GroupTimeRange(start, end any) *Query
+(*Query).WithContext(ctx context.Context) *Query
+(*Query).Get() ([]Record, error)
+
+MaxQueryBuckets = 500
+ErrInvalidQuery
+ErrStatisticsNotFound
 ```
 
 Only one service can be running or draining at a time. After `Close` completes, `Init` may create a fresh service using the same or a different database pool. A failed initialization may be retried. Old statistics handles remain closed; re-register definitions after reinitialization or a process restart. Persisted counters remain in their original database. Statistic names must be unique within the current service and contain 1 to 255 UTF-8 bytes, with no surrounding whitespace or control characters. Field names follow the stricter `stat` tag rules above. Configuration slices are copied at registration.
@@ -385,7 +412,7 @@ Record IDs are sorted within each mini-batch to give writers a consistent lock o
 
 Failed attempts retry inside the SQL backend after a random whole-second delay from **2 through 10 seconds**, inclusive, until successful or the internal context is canceled. Each failure chooses a new delay to spread retries from concurrent workers and processes; this does not guarantee that retries never overlap. This retry jitter is independent of randomized cleanup scheduling. `Close` leaves in-flight submissions and retry waits running with the same internal context, then drains newer active rows. Successful snapshot submissions restart the statistic's normal update interval. Closed pools and unreachable database servers use the same retry path.
 
-The SQL backend gives schema setup, each cleanup operation, and each mini-batch attempt a **60-second child context** of the internal service context. Queries use their own independent 60-second contexts. Cleanup is independent of uploads and cannot consume a mini-batch's write timeout. Each following mini-batch and every retry receives a fresh budget; there is no overall snapshot deadline. Timeouts require driver cancellation support to be effective.
+The SQL backend gives schema setup, each cleanup operation, and each mini-batch attempt a **60-second child context** of the internal service context. Queries and batch counts use 60-second child contexts of their caller-selected contexts. Cleanup is independent of uploads and cannot consume a mini-batch's write timeout. Each following mini-batch and every retry receives a fresh budget; there is no overall snapshot deadline. Timeouts require driver cancellation support to be effective.
 
 Uploads perform no retention cleanup. The single service-wide cleanup worker uses `cleanupInterval` in [store.go](store.go), set to 24 hours. It deletes expired records directly with a SQL predicate instead of selecting IDs for later deletion. Multiple service processes may run sweeps against the same database; deletion always checks the currently stored deadline.
 

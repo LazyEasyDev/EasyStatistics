@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math/big"
 	mathrand "math/rand"
+	"sort"
 	"sync"
 	"time"
 )
@@ -19,12 +20,19 @@ var (
 	defaultService   *service
 )
 
+var ErrStatisticsNotFound = errors.New("statistics is not registered in this process")
+
+type registeredStatistic interface {
+	Query() *Query
+	definition() StatisticsDefinition
+}
+
 type service struct {
 	backend    *sqlBackend
 	ctx        context.Context
 	cancel     context.CancelFunc
 	mu         sync.Mutex
-	statistics map[string]any
+	statistics map[string]registeredStatistic
 	closing    chan struct{}
 	workers    sync.WaitGroup
 }
@@ -66,7 +74,7 @@ func newService(backend *sqlBackend) *service {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &service{
 		backend: backend, ctx: ctx, cancel: cancel,
-		statistics: make(map[string]any), closing: make(chan struct{}),
+		statistics: make(map[string]registeredStatistic), closing: make(chan struct{}),
 	}
 }
 
@@ -140,6 +148,26 @@ func NewStatistics[T any](name string, updateInterval time.Duration, dimensions 
 }
 
 func GetStatistics[T any](name string) (*Statistics[T], error) {
+	registered, err := lookupStatistics(name)
+	if err != nil {
+		return nil, err
+	}
+	statistic, matches := registered.(*Statistics[T])
+	if !matches {
+		return nil, fmt.Errorf("statistics %q has a different values type (registered %T)", name, registered)
+	}
+	return statistic, nil
+}
+
+func QueryStatistics(name string) (*Query, error) {
+	registered, err := lookupStatistics(name)
+	if err != nil {
+		return nil, err
+	}
+	return registered.Query(), nil
+}
+
+func lookupStatistics(name string) (registeredStatistic, error) {
 	initialized, err := currentService()
 	if err != nil {
 		return nil, err
@@ -151,30 +179,45 @@ func GetStatistics[T any](name string) (*Statistics[T], error) {
 		return nil, errors.New("EasyStatistics is closed")
 	}
 	if registered == nil {
-		return nil, fmt.Errorf("statistics %q does not exist", name)
+		return nil, fmt.Errorf("statistics %q: %w", name, ErrStatisticsNotFound)
 	}
-	statistic, matches := registered.(*Statistics[T])
-	if !matches {
-		return nil, fmt.Errorf("statistics %q has a different values type (registered %T)", name, registered)
-	}
-	return statistic, nil
+	return registered, nil
 }
 
-func ListStatistics() (map[string]any, error) {
+func ListStatistics() ([]StatisticsDefinition, error) {
 	initialized, err := currentService()
 	if err != nil {
 		return nil, err
 	}
 	initialized.mu.Lock()
-	defer initialized.mu.Unlock()
 	if initialized.isClosing() {
+		initialized.mu.Unlock()
 		return nil, errors.New("EasyStatistics is closed")
 	}
-	registered := make(map[string]any, len(initialized.statistics))
-	for name, statistic := range initialized.statistics {
-		registered[name] = statistic
+	registered := make([]StatisticsDefinition, 0, len(initialized.statistics))
+	for _, statistic := range initialized.statistics {
+		registered = append(registered, statistic.definition())
 	}
+	initialized.mu.Unlock()
+	sort.Slice(registered, func(left, right int) bool { return registered[left].Name < registered[right].Name })
 	return registered, nil
+}
+
+func CountBatches(ctx context.Context) (int64, error) {
+	if ctx == nil {
+		return 0, errors.New("context is required")
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	initialized, err := currentService()
+	if err != nil {
+		return 0, err
+	}
+	if initialized.isClosing() {
+		return 0, errors.New("EasyStatistics is closed")
+	}
+	return initialized.backend.countBatches(ctx)
 }
 
 func Close() error {

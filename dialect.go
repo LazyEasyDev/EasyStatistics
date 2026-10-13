@@ -181,14 +181,26 @@ func (dialect SQLDialect) insert(table string, names ...string) string {
 	return "INSERT INTO " + dialect.quote(table) + " (" + dialect.columns(names...) + ") VALUES (" + strings.Join(parameters, ", ") + ")"
 }
 
-func (dialect SQLDialect) selectRecord() string {
-	columns := dialect.columns("name", "dimension_id", "dimension_fields", "dimension_value", "group_interval", "grouped_time", "last_update_time", "counter")
+func (dialect SQLDialect) selectRecords(count int) string {
+	columns := dialect.columns("record_id", "name", "dimension_id", "dimension_fields", "dimension_value", "group_interval", "grouped_time", "last_update_time", "counter")
 	if dialect == SQLOracle {
 		// A driver may represent both SQL NULL and EMPTY_CLOB() as nil. Keep
 		// the actual SQL nullness available so corrupt nullable schemas fail.
 		columns += ", CASE WHEN " + dialect.quote("dimension_value") + " IS NULL THEN 1 ELSE 0 END"
 	}
-	return "SELECT " + columns + " FROM " + dialect.quote(tableName) + " WHERE " + dialect.quote("record_id") + " = " + dialect.bindKey(1, 64)
+	parameters := make([]string, count)
+	for index := range parameters {
+		parameters[index] = dialect.bindKey(index+1, 64)
+	}
+	return "SELECT " + columns + " FROM " + dialect.quote(tableName) + " WHERE " + dialect.quote("record_id") + " IN (" + strings.Join(parameters, ", ") + ")"
+}
+
+func (dialect SQLDialect) countBatches() string {
+	count := "COUNT(*)"
+	if dialect == SQLServer {
+		count = "COUNT_BIG(*)"
+	}
+	return "SELECT " + count + " FROM " + dialect.quote(batchTableName)
 }
 
 func (dialect SQLDialect) selectBatch() string {
