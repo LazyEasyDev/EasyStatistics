@@ -192,6 +192,22 @@ if err != nil {
 
 This returns the same typed instance created by `NewStatistics`. Use the same values type; a different named struct type is rejected even if it has the same fields. It does not create another worker or read SQL. An unknown name, a mismatched values type, an uninitialized library, or a closing or closed service returns an error.
 
+### List Registered Statistics
+
+```go
+registered, err := EasyStatistics.ListStatistics()
+if err != nil {
+	return err
+}
+for name, handle := range registered {
+	fmt.Printf("%s: %T\n", name, handle)
+}
+```
+
+`ListStatistics() (map[string]any, error)` returns every statistic registered in the current service, keyed by name. Each value is the original `*Statistics[T]` handle, so different values types can appear in the same map. Use a type assertion such as `registered["mining_score"].(*EasyStatistics.Statistics[MiningValues])`, or use a listed name with `GetStatistics[T]`, to access a typed handle. Listing does not read SQL or create workers.
+
+The returned map is an independent snapshot: adding, deleting, or replacing its entries does not change registrations, and later registrations do not update an existing snapshot. An initialized service with no registrations returns a non-nil empty map. An uninitialized, closing, or closed service returns an error. Map iteration order is unspecified.
+
 ### Query Counters
 
 Choose exactly one configured dimension, preserve its field order, and use one of its configured intervals:

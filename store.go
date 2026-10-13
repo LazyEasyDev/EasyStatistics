@@ -160,6 +160,23 @@ func GetStatistics[T any](name string) (*Statistics[T], error) {
 	return statistic, nil
 }
 
+func ListStatistics() (map[string]any, error) {
+	initialized, err := currentService()
+	if err != nil {
+		return nil, err
+	}
+	initialized.mu.Lock()
+	defer initialized.mu.Unlock()
+	if initialized.isClosing() {
+		return nil, errors.New("EasyStatistics is closed")
+	}
+	registered := make(map[string]any, len(initialized.statistics))
+	for name, statistic := range initialized.statistics {
+		registered[name] = statistic
+	}
+	return registered, nil
+}
+
 func Close() error {
 	initialized, err := currentService()
 	if err != nil {
