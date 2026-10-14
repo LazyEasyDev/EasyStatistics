@@ -197,18 +197,21 @@ This returns the same typed instance created by `NewStatistics`. Use the same va
 ### List Registered Statistics
 
 ```go
-registered, err := EasyStatistics.ListStatistics(false)
+registered, totalDBCount, activeDBCount, err := EasyStatistics.ListStatistics(true)
 if err != nil {
 	return err
 }
 for _, definition := range registered {
 	fmt.Println(definition.Name, definition.Dimensions, definition.UpdateInterval)
 }
+fmt.Println("Total DB rows:", totalDBCount, "Active DB rows:", activeDBCount)
 ```
 
-`ListStatistics(withDBCounter bool) ([]StatisticsDefinition, error)` returns every statistic registered in the current process, ordered by name. Definitions include participating field names, configured dimensions, and the update interval. `false` keeps listing SQL-free, leaving each dimension's `Count` at zero without measuring the database. `true` queries persisted row counts once and attaches them to the exact matching name and ordered fields; a successful query with no matching group produces zero. Count merging belongs to the library, not the application.
+`ListStatistics(withDBCounter bool) (definitions []StatisticsDefinition, totalDBCount int64, activeDBCount int64, err error)` returns every statistic registered in the current process, ordered by name. Definitions include participating field names, configured dimensions, and the update interval. `false` keeps listing SQL-free, leaving each dimension's `Count` and both totals at zero without measuring the database. `true` queries persisted row counts once and attaches them to the exact matching name and ordered fields; a successful query with no matching group produces zero. Count merging belongs to the library, not the application.
 
-Counted listing uses a background context with the library's 60-second SQL timeout and returns an error with no partial definitions if counting fails. It does not discover database-only statistics or create workers. Use `DBCount(ctx)` for all stored groups with an explicit caller context, `GetStatistics[T]` to retrieve a typed handle, or `QueryStatistics(name)` to obtain a fresh query builder without knowing its Go values type. An unknown name wraps `ErrStatisticsNotFound`.
+`totalDBCount` counts every stored `easy_statistics` row, including database-only statistics and dimensions. `activeDBCount` is the sum of the returned registered dimensions' `Count` values. Both use the same grouped query result, with no separate total-count query, so `0 <= activeDBCount <= totalDBCount`. They are equal when every stored group matches a registered name and exact ordered field list. **Active means matching current registrations, not unexpired or recently updated:** matching includes all stored intervals and buckets, even intervals no longer configured for that dimension. These totals count rows, not counter values or buffered additions.
+
+Counted listing uses a background context with the library's 60-second SQL timeout and returns an error with no partial definitions and zero totals if counting fails. It does not discover database-only statistics or create workers. Use `DBCount(ctx)` for all stored groups with an explicit caller context, `GetStatistics[T]` to retrieve a typed handle, or `QueryStatistics(name)` to obtain a fresh query builder without knowing its Go values type. An unknown name wraps `ErrStatisticsNotFound`.
 
 The returned definitions are independent snapshots, including their nested slices. Later registrations do not update an existing snapshot. An initialized service with no registrations returns a non-nil empty slice. An uninitialized, closing, or closed service returns an error. Definition and record types use snake_case JSON tags; definition durations retain Go's nanosecond representation.
 
@@ -225,6 +228,8 @@ for _, counted := range counts {
 ```
 
 `DBCount(ctx) ([]DimensionCount, error)` groups all persisted `easy_statistics` rows by the exact statistic name and ordered field list, including statistics not registered in the current process. Keys are case-sensitive and preserve Unicode spelling and field order. Each `int64` count includes every stored value, interval, and bucket in that dimension; it is **not** a sum of counters, a distinct-value count, or a count of buffered additions. Zero and negative counters still count as rows. Expired rows remain included until cleanup physically deletes them.
+
+To obtain the total number of stored rows, sum every returned dimension's `Count`. Each row belongs to exactly one group, so the sum is equivalent to `COUNT(*)` for the same grouped query result, without issuing another SQL query.
 
 Results are ordered by name and encoded fields. An empty table returns a non-nil empty slice, and groups without stored rows are absent. Initialization, shutdown, cancellation, invalid stored metadata, and database errors return an error with no partial counts. The caller's context has a 60-second maximum SQL timeout. The query scans stored rows; no grouping index or precomputed counts are maintained.
 
@@ -378,7 +383,7 @@ SQL Server 2022 CU27 (16.0.4295.3) with `go-mssqldb` 1.11.2 was also exercised a
 Init(database *sql.DB, dialect SQLDialect) error
 NewStatistics[T any](name string, updateInterval time.Duration, dimensions []Dimension) (*Statistics[T], error)
 GetStatistics[T any](name string) (*Statistics[T], error)
-ListStatistics(withDBCounter bool) ([]StatisticsDefinition, error)
+ListStatistics(withDBCounter bool) (definitions []StatisticsDefinition, totalDBCount int64, activeDBCount int64, err error)
 QueryStatistics(name string) (*Query, error)
 DBCount(ctx context.Context) ([]DimensionCount, error)
 CountBatches(ctx context.Context) (int64, error)

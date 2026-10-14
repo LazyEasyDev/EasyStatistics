@@ -185,15 +185,15 @@ func lookupStatistics(name string) (registeredStatistic, error) {
 	return registered, nil
 }
 
-func ListStatistics(withDBCounter bool) ([]StatisticsDefinition, error) {
+func ListStatistics(withDBCounter bool) (definitions []StatisticsDefinition, totalDBCount int64, activeDBCount int64, err error) {
 	initialized, err := currentService()
 	if err != nil {
-		return nil, err
+		return nil, 0, 0, err
 	}
 	initialized.mu.Lock()
 	if initialized.isClosing() {
 		initialized.mu.Unlock()
-		return nil, errors.New("EasyStatistics is closed")
+		return nil, 0, 0, errors.New("EasyStatistics is closed")
 	}
 	registered := make([]StatisticsDefinition, 0, len(initialized.statistics))
 	for _, statistic := range initialized.statistics {
@@ -201,10 +201,11 @@ func ListStatistics(withDBCounter bool) ([]StatisticsDefinition, error) {
 	}
 	initialized.mu.Unlock()
 	if withDBCounter {
-		counts, err := initialized.backend.count(context.Background())
+		counts, total, err := initialized.backend.count(context.Background())
 		if err != nil {
-			return nil, err
+			return nil, 0, 0, err
 		}
+		totalDBCount = total
 		type dimensionKey struct {
 			name   string
 			fields string
@@ -217,11 +218,12 @@ func ListStatistics(withDBCounter bool) ([]StatisticsDefinition, error) {
 			for index := range definition.Dimensions {
 				dimension := &definition.Dimensions[index]
 				dimension.Count = stored[dimensionKey{name: definition.Name, fields: strings.Join(dimension.OrderFields, ":")}]
+				activeDBCount += dimension.Count
 			}
 		}
 	}
 	sort.Slice(registered, func(left, right int) bool { return registered[left].Name < registered[right].Name })
-	return registered, nil
+	return registered, totalDBCount, activeDBCount, nil
 }
 
 func DBCount(ctx context.Context) ([]DimensionCount, error) {
@@ -238,7 +240,8 @@ func DBCount(ctx context.Context) ([]DimensionCount, error) {
 	if initialized.isClosing() {
 		return nil, errors.New("EasyStatistics is closed")
 	}
-	return initialized.backend.count(ctx)
+	counts, _, err := initialized.backend.count(ctx)
+	return counts, err
 }
 
 func CountBatches(ctx context.Context) (int64, error) {

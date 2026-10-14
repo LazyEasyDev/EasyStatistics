@@ -199,37 +199,39 @@ func (backend *sqlBackend) getRows(ctx context.Context, identities []string) (ma
 	return result, nil
 }
 
-func (backend *sqlBackend) count(ctx context.Context) ([]DimensionCount, error) {
+func (backend *sqlBackend) count(ctx context.Context) ([]DimensionCount, int64, error) {
 	ctx, cancel := context.WithTimeout(ctx, sqlTimeout)
 	defer cancel()
 	rows, err := backend.db.QueryContext(ctx, backend.dialect.countRecords())
 	if err != nil {
-		return nil, fmt.Errorf("count stored statistics records: %w", err)
+		return nil, 0, fmt.Errorf("count stored statistics records: %w", err)
 	}
 	defer rows.Close()
 	counts := make([]DimensionCount, 0)
+	var totalDBCount int64
 	for rows.Next() {
 		var counted DimensionCount
 		var encodedFields string
 		if err := rows.Scan(&counted.Name, &encodedFields, &counted.Count); err != nil {
-			return nil, fmt.Errorf("read statistics count: %w", err)
+			return nil, 0, fmt.Errorf("read statistics count: %w", err)
 		}
 		if err := validateIdentifier(counted.Name); err != nil {
-			return nil, fmt.Errorf("stored statistics name: %w", err)
+			return nil, 0, fmt.Errorf("stored statistics name: %w", err)
 		}
 		if len(encodedFields) > MaxDimensionFieldsBytes {
-			return nil, errors.New("stored dimension_fields exceeds its byte limit")
+			return nil, 0, errors.New("stored dimension_fields exceeds its byte limit")
 		}
 		counted.OrderFields = strings.Split(encodedFields, ":")
 		for _, field := range counted.OrderFields {
 			if !validStatName(field) {
-				return nil, fmt.Errorf("stored dimension field %q is invalid", field)
+				return nil, 0, fmt.Errorf("stored dimension field %q is invalid", field)
 			}
 		}
 		counts = append(counts, counted)
+		totalDBCount += counted.Count
 	}
 	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
-		return nil, fmt.Errorf("read statistics counts: %w", err)
+		return nil, 0, fmt.Errorf("read statistics counts: %w", err)
 	}
 	sort.Slice(counts, func(left, right int) bool {
 		if counts[left].Name != counts[right].Name {
@@ -237,7 +239,7 @@ func (backend *sqlBackend) count(ctx context.Context) ([]DimensionCount, error) 
 		}
 		return strings.Join(counts[left].OrderFields, ":") < strings.Join(counts[right].OrderFields, ":")
 	})
-	return counts, nil
+	return counts, totalDBCount, nil
 }
 
 func (backend *sqlBackend) countBatches(ctx context.Context) (int64, error) {
